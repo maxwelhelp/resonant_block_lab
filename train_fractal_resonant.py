@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from resonant_block_lab.fractal_sequence import FractalResonantSequenceClassifier
+from resonant_block_lab.program_brain import ProgramBrain, write_program_brain_outputs
 
 class SeqProgramDataset(Dataset):
     def __init__(self, n=12000, length=128, input_dim=16, classes=8, seed=1, noise=0.24):
@@ -62,7 +63,7 @@ def avg(rows,k):
     return sum(vals)/max(1,len(vals))
 
 def run_epoch(model,loader,opt,args,device,train=True):
-    model.train(train); ok=tot=0; logs=[]; last=None; last_y=None
+    model.train(train); ok=tot=0; logs=[]; last=None; last_y=None; brain=ProgramBrain() if not train else None
     for bi,(x,y) in enumerate(loader,1):
         x=x.to(device,non_blocking=True); y=y.to(device,non_blocking=True)
         with torch.set_grad_enabled(train):
@@ -71,6 +72,8 @@ def run_epoch(model,loader,opt,args,device,train=True):
             if train:
                 opt.zero_grad(set_to_none=True); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(),1.0); opt.step()
         ok+=(logits.argmax(-1)==y).sum().item(); tot+=y.numel(); last=stats; last_y=y.detach().cpu()
+        if brain is not None:
+            brain.add(stats, y, logits)
         rec={k:float(v.detach().cpu()) for k,v in ls.items()}
         rec.update({'macc':acc_last(stats,y,'macro_logits'),'uacc':acc_last(stats,y,'micro_logits'),
                     'alpha':float(stats['gate_history'][:,0].mean().detach().cpu()),
@@ -83,7 +86,7 @@ def run_epoch(model,loader,opt,args,device,train=True):
         logs.append(rec)
         if train and args.log_every and bi%args.log_every==0:
             print(f"batch {bi:4d}/{len(loader)} loss={float(loss.detach()):.3f} ce={rec['ce']:.3f} attr={rec['attr_ce']:.3f} macro={rec['macro_ce']:.3f} micro={rec['micro_ce']:.3f} macc={rec['macc']:.3f} uacc={rec['uacc']:.3f} alpha={rec['alpha']:.3f} H={rec['eff_H']:.3f}",flush=True)
-    return ok/max(1,tot), logs, last, last_y
+    return ok/max(1,tot), logs, last, last_y, brain
 
 def save_diag(out, stats, y):
     if stats is None or y is None: return
@@ -139,7 +142,7 @@ def main():
     print('params',sum(p.numel() for p in model.parameters() if p.requires_grad),flush=True)
     rows=[]; best=0.0
     for ep in range(1,args.epochs+1):
-        t=time.time(); tr_acc,tr_logs,_,_=run_epoch(model,tr,opt,args,device,True); va_acc,va_logs,last,last_y=run_epoch(model,va,opt,args,device,False)
+        t=time.time(); tr_acc,tr_logs,_,_,_=run_epoch(model,tr,opt,args,device,True); va_acc,va_logs,last,last_y,brain=run_epoch(model,va,opt,args,device,False)
         row={'epoch':ep,'train_acc':tr_acc,'val_acc':va_acc,'sec':time.time()-t,
              'train_ce':avg(tr_logs,'ce'),'train_attr_ce':avg(tr_logs,'attr_ce'),'train_macro_ce':avg(tr_logs,'macro_ce'),'train_micro_ce':avg(tr_logs,'micro_ce'),
              'train_macc':avg(tr_logs,'macc'),'train_uacc':avg(tr_logs,'uacc'),'train_alpha':avg(tr_logs,'alpha'),'train_beta':avg(tr_logs,'beta'),
@@ -151,6 +154,9 @@ def main():
              'val_macro_H':avg(va_logs,'macro_H'),'val_micro_H':avg(va_logs,'micro_H'),'val_eff_H':avg(va_logs,'eff_H')}
         if last is not None: row['program']=last['program']
         save_diag(out,last,last_y)
+        if brain is not None:
+            summary=brain.finalize(ep,row)
+            write_program_brain_outputs(out,summary,best_acc=best,row_acc=va_acc)
         rows.append(row); print(json.dumps(row,ensure_ascii=False)[:1600],flush=True)
         if va_acc>best: best=va_acc; torch.save({'model':model.state_dict(),'args':vars(args),'row':row},out/'best.pt'); print(f'best={best:.4f}',flush=True)
         keys=[k for k in rows[0] if k!='program']
