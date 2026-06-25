@@ -132,7 +132,7 @@ class FractalResonantSequenceBlock(nn.Module):
 
         macro_states, micro_states = [], []
         macro_logits, micro_logits = [], []
-        macro_q_hist, micro_q_hist, q_eff_hist, gate_hist = [], [], [], []
+        macro_plan_q_hist, micro_macro_q_hist, micro_q_hist, q_eff_hist, gate_hist = [], [], [], [], []
         macro_delta_hist, micro_delta_hist, ent_hist = [], [], []
 
         for t in range(self.config.macro_steps):
@@ -140,6 +140,7 @@ class FractalResonantSequenceBlock(nn.Module):
             macro_cfg = self.controller(psi.mean(1), macro_ctx, memory, t, 0, level_id=0)
             memory = macro_cfg['memory']
             macro_q = macro_cfg['macro_q']
+            macro_plan_q_hist.append(macro_q)
             old_macro = psi
             phi = psi
 
@@ -156,7 +157,7 @@ class FractalResonantSequenceBlock(nn.Module):
                 if self.affine_projector is not None:
                     micro_logits.append(self.affine_projector(self.features(phi)))
                 micro_states.append(phi)
-                macro_q_hist.append(macro_q_for_update)
+                micro_macro_q_hist.append(macro_q_for_update)
                 micro_q_hist.append(micro_q)
                 macro_mix = gates[:, 5].view(b, 1)
                 q_eff_hist.append(F.normalize(macro_mix * macro_q_for_update + (1.0 - macro_mix) * micro_q, p=1, dim=-1))
@@ -176,14 +177,16 @@ class FractalResonantSequenceBlock(nn.Module):
             return y
 
         q_eff_all = torch.stack(q_eff_hist, dim=1) if q_eff_hist else torch.empty(0, device=x.device)
-        macro_q_all = torch.stack(macro_q_hist, dim=1)
+        macro_q_all = torch.stack(macro_plan_q_hist, dim=1)
+        micro_macro_q_all = torch.stack(micro_macro_q_hist, dim=1)
         micro_q_all = torch.stack(micro_q_hist, dim=1)
         stats = {
             'macro_history': torch.stack(macro_states, dim=1),
             'micro_history': torch.stack(micro_states, dim=1),
-            # This is macro-q actually used inside every micro update.
+            # Audio-v4 compatible: macro_q_history is one entry per macro step.
             'macro_q_history': macro_q_all,
-            'micro_macro_q_history': macro_q_all,
+            # Macro-q actually used inside every micro update.
+            'micro_macro_q_history': micro_macro_q_all,
             'micro_q_history': micro_q_all,
             'q_eff_history': q_eff_all,
             'gate_history': torch.stack(gate_hist, dim=0),
@@ -192,6 +195,7 @@ class FractalResonantSequenceBlock(nn.Module):
             'macro_mode_entropy': -(macro_q_all.clamp_min(1e-8).log() * macro_q_all).sum(dim=-1).mean(),
             'micro_mode_entropy': -(micro_q_all.clamp_min(1e-8).log() * micro_q_all).sum(dim=-1).mean(),
             'eff_mode_entropy': -(q_eff_all.clamp_min(1e-8).log() * q_eff_all).sum(dim=-1).mean(),
+            'psi_final': y,
             'field_energy': y.pow(2).mean(),
             'attn_entropy': torch.stack(ent_hist).mean(),
             'program': self.bank.replay_description(q_eff_all.reshape(-1, self.config.n_modes)),

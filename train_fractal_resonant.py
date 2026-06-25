@@ -87,13 +87,21 @@ def run_epoch(model,loader,opt,args,device,train=True):
 
 def save_diag(out, stats, y):
     if stats is None or y is None: return
-    y=y.view(-1,1)
+    y_flat=y.view(-1)
+    y=y_flat.view(-1,1)
     mp=stats['macro_logits'].detach().cpu().argmax(-1)
     up=stats['micro_logits'].detach().cpu().argmax(-1)
+    nearest=[]
+    if 'attractor_energy' in stats:
+        e=stats['attractor_energy'].detach().float().cpu()
+        top=e[:min(8,e.shape[0])].argsort(dim=1)[:,:min(5,e.shape[1])]
+        for i in range(top.shape[0]):
+            nearest.append({'true': int(y_flat[i]), 'nearest': [(int(j), float(e[i,j])) for j in top[i]]})
     diag={
         'macro_acc_by_step': (mp==y).float().mean(0).numpy().round(5).tolist(),
         'micro_acc_by_microstep_flat': (up==y).float().mean(0).numpy().round(5).tolist(),
-        'macro_mode_schedule_mean_by_microstep': stats['macro_q_history'].detach().float().mean(0).cpu().numpy().round(5).tolist(),
+        'macro_mode_schedule_mean_by_step': stats['macro_q_history'].detach().float().mean(0).cpu().numpy().round(5).tolist(),
+        'micro_macro_mode_schedule_mean_by_microstep': stats['micro_macro_q_history'].detach().float().mean(0).cpu().numpy().round(5).tolist(),
         'micro_mode_schedule_mean_by_microstep': stats['micro_q_history'].detach().float().mean(0).cpu().numpy().round(5).tolist(),
         'effective_mode_schedule_mean_by_microstep': stats['q_eff_history'].detach().float().mean(0).cpu().numpy().round(5).tolist(),
         'gate_schedule_alpha_beta_gamma_eta_rho_macroMix': stats['gate_history'].detach().float().cpu().numpy().round(5).tolist(),
@@ -104,6 +112,7 @@ def save_diag(out, stats, y):
         'eff_mode_entropy': float(stats['eff_mode_entropy'].detach().cpu()),
         'attn_entropy': float(stats['attn_entropy'].detach().cpu()),
         'field_energy': float(stats['field_energy'].detach().cpu()),
+        'nearest_examples': nearest,
         'program': stats['program'],
     }
     (out/'diagnostics.json').write_text(json.dumps(diag,indent=2,ensure_ascii=False),encoding='utf-8')
@@ -134,9 +143,11 @@ def main():
         row={'epoch':ep,'train_acc':tr_acc,'val_acc':va_acc,'sec':time.time()-t,
              'train_ce':avg(tr_logs,'ce'),'train_attr_ce':avg(tr_logs,'attr_ce'),'train_macro_ce':avg(tr_logs,'macro_ce'),'train_micro_ce':avg(tr_logs,'micro_ce'),
              'train_macc':avg(tr_logs,'macc'),'train_uacc':avg(tr_logs,'uacc'),'train_alpha':avg(tr_logs,'alpha'),'train_beta':avg(tr_logs,'beta'),
+             'train_margin':avg(tr_logs,'margin'),'train_sep':avg(tr_logs,'sep'),'train_field_energy_loss':avg(tr_logs,'field_energy'),'train_correct_energy':avg(tr_logs,'correct_energy'),'train_wrong_energy':avg(tr_logs,'wrong_energy'),
              'train_macro_H':avg(tr_logs,'macro_H'),'train_micro_H':avg(tr_logs,'micro_H'),'train_eff_H':avg(tr_logs,'eff_H'),
              'val_ce':avg(va_logs,'ce'),'val_attr_ce':avg(va_logs,'attr_ce'),'val_macro_ce':avg(va_logs,'macro_ce'),'val_micro_ce':avg(va_logs,'micro_ce'),
              'val_macc':avg(va_logs,'macc'),'val_uacc':avg(va_logs,'uacc'),'val_alpha':avg(va_logs,'alpha'),'val_beta':avg(va_logs,'beta'),
+             'val_margin':avg(va_logs,'margin'),'val_sep':avg(va_logs,'sep'),'val_field_energy_loss':avg(va_logs,'field_energy'),'val_correct_energy':avg(va_logs,'correct_energy'),'val_wrong_energy':avg(va_logs,'wrong_energy'),
              'val_macro_H':avg(va_logs,'macro_H'),'val_micro_H':avg(va_logs,'micro_H'),'val_eff_H':avg(va_logs,'eff_H')}
         if last is not None: row['program']=last['program']
         save_diag(out,last,last_y)
