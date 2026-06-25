@@ -176,15 +176,23 @@ class FractalResonantSequenceBlock(nn.Module):
             return y
 
         q_eff_all = torch.stack(q_eff_hist, dim=1) if q_eff_hist else torch.empty(0, device=x.device)
+        macro_q_all = torch.stack(macro_q_hist, dim=1)
+        micro_q_all = torch.stack(micro_q_hist, dim=1)
         stats = {
             'macro_history': torch.stack(macro_states, dim=1),
             'micro_history': torch.stack(micro_states, dim=1),
-            'macro_q_history': torch.stack(macro_q_hist, dim=1),
-            'micro_q_history': torch.stack(micro_q_hist, dim=1),
+            # This is macro-q actually used inside every micro update.
+            'macro_q_history': macro_q_all,
+            'micro_macro_q_history': macro_q_all,
+            'micro_q_history': micro_q_all,
             'q_eff_history': q_eff_all,
             'gate_history': torch.stack(gate_hist, dim=0),
             'macro_deltas': torch.stack(macro_delta_hist, dim=1),
             'micro_deltas': torch.stack(micro_delta_hist, dim=1),
+            'macro_mode_entropy': -(macro_q_all.clamp_min(1e-8).log() * macro_q_all).sum(dim=-1).mean(),
+            'micro_mode_entropy': -(micro_q_all.clamp_min(1e-8).log() * micro_q_all).sum(dim=-1).mean(),
+            'eff_mode_entropy': -(q_eff_all.clamp_min(1e-8).log() * q_eff_all).sum(dim=-1).mean(),
+            'field_energy': y.pow(2).mean(),
             'attn_entropy': torch.stack(ent_hist).mean(),
             'program': self.bank.replay_description(q_eff_all.reshape(-1, self.config.n_modes)),
         }
@@ -195,11 +203,53 @@ class FractalResonantSequenceBlock(nn.Module):
         return y, stats
 
 
+class SequenceAttractorHead(nn.Module):
+    """Feature-space attractor head for dynamic sequence length.
+
+    Audio v4 keeps attractors in [nodes,dim]. Sequence blocks have dynamic L,
+    so the attractor lives in pooled field features [mean,std,max,energy].
+    """
+    def __init__(self, n_classes: int, dim: int, temperature: float = 0.35, head_mode: str = 'attractor_only'):
+        super().__init__()
+        self.n_classes = int(n_classes)
+        self.dim = int(dim)
+        self.head_mode = str(head_mode)
+        self.attractors = nn.Parameter(torch.randn(n_classes, dim * 4) * 0.02)
+        self.log_temperature = nn.Parameter(torch.log(torch.tensor(float(temperature))))
+        self.linear_aux = nn.Linear(dim * 4, n_classes)
+        self.mix = nn.Parameter(torch.tensor(0.15))
+
+    def energy_logits(self, feats: torch.Tensor):
+        z = F.normalize(feats, dim=-1)
+        a = F.normalize(self.attractors, dim=-1)
+        cosine = z @ a.T
+        energy = 1.0 - cosine
+        temp = self.log_temperature.exp().clamp(0.05, 5.0)
+        return cosine / temp, energy, energy.min(dim=1).values
+
+    def forward(self, feats: torch.Tensor):
+        attr_logits, energy, min_energy = self.energy_logits(feats)
+        linear_logits = self.linear_aux(feats)
+        if self.head_mode == 'linear_only':
+            logits = linear_logits
+        elif self.head_mode == 'hybrid':
+            logits = attr_logits + self.mix.clamp(0.0, 2.0) * linear_logits
+        else:
+            logits = attr_logits
+        return logits, attr_logits, linear_logits, energy, min_energy
+
+    def separation_loss(self, min_dist: float = 0.08) -> torch.Tensor:
+        a = F.normalize(self.attractors, dim=-1)
+        energy = 1.0 - (a @ a.T)
+        mask = ~torch.eye(self.n_classes, device=energy.device, dtype=torch.bool)
+        return F.relu(float(min_dist) - energy[mask]).mean()
+
+
 class FractalResonantSequenceClassifier(nn.Module):
     """Resonant-only classifier: no parallel fallback as a hidden crutch."""
     def __init__(self, input_dim: int, dim: int, n_classes: int,
                  n_modes: int = 8, macro_steps: int = 8, micro_steps: int = 3,
-                 use_ff_refine: bool = False):
+                 use_ff_refine: bool = False, head_mode: str = 'attractor_only'):
         super().__init__()
         self.in_proj = nn.Linear(input_dim, dim)
         cfg = FractalResonantConfig(
@@ -211,7 +261,7 @@ class FractalResonantSequenceClassifier(nn.Module):
             use_ff_refine=use_ff_refine,
         )
         self.block = FractalResonantSequenceBlock(cfg)
-        self.head = nn.Linear(dim * 4, n_classes)
+        self.head = SequenceAttractorHead(n_classes, dim, head_mode=head_mode)
 
     def forward(self, x: torch.Tensor, return_stats: bool = False):
         h = self.in_proj(x)
@@ -220,5 +270,15 @@ class FractalResonantSequenceClassifier(nn.Module):
         else:
             h = self.block(h, return_stats=False)
             stats = {}
-        logits = self.head(FractalResonantSequenceBlock.features(h))
+        feats = FractalResonantSequenceBlock.features(h)
+        logits, attr_logits, linear_logits, energy, min_energy = self.head(feats)
+        if return_stats:
+            stats.update({
+                'attr_logits': attr_logits,
+                'linear_logits': linear_logits,
+                'attractor_energy': energy,
+                'min_energy': min_energy,
+                'field_energy': h.pow(2).mean(),
+                'final_features': feats,
+            })
         return (logits, stats) if return_stats else logits

@@ -32,16 +32,27 @@ def seq_ce(logits, y, a, b):
     w = torch.linspace(a,b,S,device=y.device).view(1,S)
     return (ce*w).sum()/(w.sum()*B)
 
-def loss_fn(logits, stats, y, args):
+def loss_fn(logits, stats, y, args, model=None):
     ce = F.cross_entropy(logits,y)
+    attr_ce = F.cross_entropy(stats['attr_logits'], y) if 'attr_logits' in stats else ce*0
     macro = seq_ce(stats['macro_logits'],y,0.15,1.0)
     micro = seq_ce(stats['micro_logits'],y,0.05,0.65)
     alpha = stats['gate_history'][:,0]
     skip = F.relu(args.alpha_min-alpha).pow(2).mean()
     md = stats['micro_deltas']
     smooth = md[:,1:].sub(md[:,:-1]).abs().mean() if md.shape[1] > 1 else md.mean()*0
-    total = ce + args.w_macro*macro + args.w_micro*micro + args.w_skip*skip + args.w_smooth*smooth
-    return total, {'ce':ce,'macro_ce':macro,'micro_ce':micro,'skip':skip,'smooth':smooth}
+    if 'attractor_energy' in stats:
+        e = stats['attractor_energy']
+        good = e.gather(1, y.view(-1,1)).squeeze(1)
+        bad = e.masked_fill(F.one_hot(y, num_classes=e.shape[1]).bool(), float('inf')).min(dim=1).values
+        margin = F.relu(good - bad + args.margin).mean()
+        good_e = good.mean().detach(); bad_e = bad.mean().detach()
+    else:
+        margin = ce*0; good_e = ce.detach()*0; bad_e = ce.detach()*0
+    sep = model.head.separation_loss() if model is not None and hasattr(model, 'head') and hasattr(model.head, 'separation_loss') else ce*0
+    field_energy = (stats.get('field_energy', torch.tensor(1.0, device=y.device)) - 1.0).pow(2)
+    total = ce + args.w_attr*attr_ce + args.w_macro*macro + args.w_micro*micro + args.w_margin*margin + args.w_sep*sep + args.w_energy*field_energy + args.w_skip*skip + args.w_smooth*smooth
+    return total, {'ce':ce,'attr_ce':attr_ce,'macro_ce':macro,'micro_ce':micro,'margin':margin,'sep':sep,'field_energy':field_energy,'skip':skip,'smooth':smooth,'correct_energy':good_e,'wrong_energy':bad_e}
 
 def acc_last(stats,y,key):
     return float((stats[key][:,-1].argmax(-1)==y).float().mean().detach().cpu())
@@ -51,24 +62,52 @@ def avg(rows,k):
     return sum(vals)/max(1,len(vals))
 
 def run_epoch(model,loader,opt,args,device,train=True):
-    model.train(train); ok=tot=0; logs=[]; last=None
+    model.train(train); ok=tot=0; logs=[]; last=None; last_y=None
     for bi,(x,y) in enumerate(loader,1):
         x=x.to(device,non_blocking=True); y=y.to(device,non_blocking=True)
         with torch.set_grad_enabled(train):
             logits,stats=model(x,return_stats=True)
-            loss,ls=loss_fn(logits,stats,y,args)
+            loss,ls=loss_fn(logits,stats,y,args,model)
             if train:
                 opt.zero_grad(set_to_none=True); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(),1.0); opt.step()
-        ok+=(logits.argmax(-1)==y).sum().item(); tot+=y.numel(); last=stats
+        ok+=(logits.argmax(-1)==y).sum().item(); tot+=y.numel(); last=stats; last_y=y.detach().cpu()
         rec={k:float(v.detach().cpu()) for k,v in ls.items()}
         rec.update({'macc':acc_last(stats,y,'macro_logits'),'uacc':acc_last(stats,y,'micro_logits'),
                     'alpha':float(stats['gate_history'][:,0].mean().detach().cpu()),
+                    'beta':float(stats['gate_history'][:,1].mean().detach().cpu()),
+                    'macro_H':float(stats['macro_mode_entropy'].detach().cpu()),
+                    'micro_H':float(stats['micro_mode_entropy'].detach().cpu()),
+                    'eff_H':float(stats['eff_mode_entropy'].detach().cpu()),
                     'mdlast':float(stats['macro_deltas'][:,-1].mean().detach().cpu()),
                     'udlast':float(stats['micro_deltas'][:,-1].mean().detach().cpu())})
         logs.append(rec)
         if train and args.log_every and bi%args.log_every==0:
-            print(f"batch {bi:4d}/{len(loader)} loss={float(loss.detach()):.3f} ce={rec['ce']:.3f} macro={rec['macro_ce']:.3f} micro={rec['micro_ce']:.3f} macc={rec['macc']:.3f} uacc={rec['uacc']:.3f} alpha={rec['alpha']:.3f}",flush=True)
-    return ok/max(1,tot), logs, last
+            print(f"batch {bi:4d}/{len(loader)} loss={float(loss.detach()):.3f} ce={rec['ce']:.3f} attr={rec['attr_ce']:.3f} macro={rec['macro_ce']:.3f} micro={rec['micro_ce']:.3f} macc={rec['macc']:.3f} uacc={rec['uacc']:.3f} alpha={rec['alpha']:.3f} H={rec['eff_H']:.3f}",flush=True)
+    return ok/max(1,tot), logs, last, last_y
+
+def save_diag(out, stats, y):
+    if stats is None or y is None: return
+    y=y.view(-1,1)
+    mp=stats['macro_logits'].detach().cpu().argmax(-1)
+    up=stats['micro_logits'].detach().cpu().argmax(-1)
+    diag={
+        'macro_acc_by_step': (mp==y).float().mean(0).numpy().round(5).tolist(),
+        'micro_acc_by_microstep_flat': (up==y).float().mean(0).numpy().round(5).tolist(),
+        'macro_mode_schedule_mean_by_microstep': stats['macro_q_history'].detach().float().mean(0).cpu().numpy().round(5).tolist(),
+        'micro_mode_schedule_mean_by_microstep': stats['micro_q_history'].detach().float().mean(0).cpu().numpy().round(5).tolist(),
+        'effective_mode_schedule_mean_by_microstep': stats['q_eff_history'].detach().float().mean(0).cpu().numpy().round(5).tolist(),
+        'gate_schedule_alpha_beta_gamma_eta_rho_macroMix': stats['gate_history'].detach().float().cpu().numpy().round(5).tolist(),
+        'macro_delta_mean_by_step': stats['macro_deltas'].detach().float().mean(0).cpu().numpy().round(5).tolist(),
+        'micro_delta_mean_by_microstep': stats['micro_deltas'].detach().float().mean(0).cpu().numpy().round(5).tolist(),
+        'macro_mode_entropy': float(stats['macro_mode_entropy'].detach().cpu()),
+        'micro_mode_entropy': float(stats['micro_mode_entropy'].detach().cpu()),
+        'eff_mode_entropy': float(stats['eff_mode_entropy'].detach().cpu()),
+        'attn_entropy': float(stats['attn_entropy'].detach().cpu()),
+        'field_energy': float(stats['field_energy'].detach().cpu()),
+        'program': stats['program'],
+    }
+    (out/'diagnostics.json').write_text(json.dumps(diag,indent=2,ensure_ascii=False),encoding='utf-8')
+
 
 def main():
     p=argparse.ArgumentParser()
@@ -78,25 +117,29 @@ def main():
     p.add_argument('--n_modes',type=int,default=8); p.add_argument('--macro_steps',type=int,default=8); p.add_argument('--micro_steps',type=int,default=3)
     p.add_argument('--train_n',type=int,default=12000); p.add_argument('--val_n',type=int,default=2000); p.add_argument('--noise',type=float,default=0.24)
     p.add_argument('--lr',type=float,default=3e-4); p.add_argument('--w_macro',type=float,default=0.35); p.add_argument('--w_micro',type=float,default=0.30)
-    p.add_argument('--w_skip',type=float,default=0.02); p.add_argument('--w_smooth',type=float,default=0.02); p.add_argument('--alpha_min',type=float,default=0.20)
-    p.add_argument('--use_ff_refine',action='store_true'); p.add_argument('--device',default='cuda' if torch.cuda.is_available() else 'cpu')
+    p.add_argument('--w_attr',type=float,default=0.25); p.add_argument('--w_margin',type=float,default=0.05); p.add_argument('--w_sep',type=float,default=0.02); p.add_argument('--w_energy',type=float,default=0.01)
+    p.add_argument('--w_skip',type=float,default=0.02); p.add_argument('--w_smooth',type=float,default=0.02); p.add_argument('--alpha_min',type=float,default=0.20); p.add_argument('--margin',type=float,default=0.08)
+    p.add_argument('--use_ff_refine',action='store_true'); p.add_argument('--head_mode',default='attractor_only',choices=['attractor_only','hybrid','linear_only']); p.add_argument('--device',default='cuda' if torch.cuda.is_available() else 'cpu')
     p.add_argument('--out_dir',default='runs/fractal_resonant_full'); p.add_argument('--log_every',type=int,default=25)
     args=p.parse_args(); device=torch.device(args.device if args.device=='cpu' or torch.cuda.is_available() else 'cpu')
     out=Path(args.out_dir); out.mkdir(parents=True,exist_ok=True); (out/'config.json').write_text(json.dumps(vars(args),indent=2,ensure_ascii=False))
     tr=DataLoader(SeqProgramDataset(args.train_n,args.length,args.input_dim,args.classes,1,args.noise),batch_size=args.batch,shuffle=True,pin_memory=device.type=='cuda')
     va=DataLoader(SeqProgramDataset(args.val_n,args.length,args.input_dim,args.classes,999,args.noise),batch_size=args.batch,shuffle=False,pin_memory=device.type=='cuda')
-    model=FractalResonantSequenceClassifier(args.input_dim,args.dim,args.classes,args.n_modes,args.macro_steps,args.micro_steps,args.use_ff_refine).to(device)
+    model=FractalResonantSequenceClassifier(args.input_dim,args.dim,args.classes,args.n_modes,args.macro_steps,args.micro_steps,args.use_ff_refine,args.head_mode).to(device)
     opt=torch.optim.AdamW(model.parameters(),lr=args.lr,weight_decay=1e-4)
     print('params',sum(p.numel() for p in model.parameters() if p.requires_grad),flush=True)
     rows=[]; best=0.0
     for ep in range(1,args.epochs+1):
-        t=time.time(); tr_acc,tr_logs,_=run_epoch(model,tr,opt,args,device,True); va_acc,va_logs,last=run_epoch(model,va,opt,args,device,False)
+        t=time.time(); tr_acc,tr_logs,_,_=run_epoch(model,tr,opt,args,device,True); va_acc,va_logs,last,last_y=run_epoch(model,va,opt,args,device,False)
         row={'epoch':ep,'train_acc':tr_acc,'val_acc':va_acc,'sec':time.time()-t,
-             'train_ce':avg(tr_logs,'ce'),'train_macro_ce':avg(tr_logs,'macro_ce'),'train_micro_ce':avg(tr_logs,'micro_ce'),
-             'train_macc':avg(tr_logs,'macc'),'train_uacc':avg(tr_logs,'uacc'),'train_alpha':avg(tr_logs,'alpha'),
-             'val_ce':avg(va_logs,'ce'),'val_macro_ce':avg(va_logs,'macro_ce'),'val_micro_ce':avg(va_logs,'micro_ce'),
-             'val_macc':avg(va_logs,'macc'),'val_uacc':avg(va_logs,'uacc'),'val_alpha':avg(va_logs,'alpha')}
+             'train_ce':avg(tr_logs,'ce'),'train_attr_ce':avg(tr_logs,'attr_ce'),'train_macro_ce':avg(tr_logs,'macro_ce'),'train_micro_ce':avg(tr_logs,'micro_ce'),
+             'train_macc':avg(tr_logs,'macc'),'train_uacc':avg(tr_logs,'uacc'),'train_alpha':avg(tr_logs,'alpha'),'train_beta':avg(tr_logs,'beta'),
+             'train_macro_H':avg(tr_logs,'macro_H'),'train_micro_H':avg(tr_logs,'micro_H'),'train_eff_H':avg(tr_logs,'eff_H'),
+             'val_ce':avg(va_logs,'ce'),'val_attr_ce':avg(va_logs,'attr_ce'),'val_macro_ce':avg(va_logs,'macro_ce'),'val_micro_ce':avg(va_logs,'micro_ce'),
+             'val_macc':avg(va_logs,'macc'),'val_uacc':avg(va_logs,'uacc'),'val_alpha':avg(va_logs,'alpha'),'val_beta':avg(va_logs,'beta'),
+             'val_macro_H':avg(va_logs,'macro_H'),'val_micro_H':avg(va_logs,'micro_H'),'val_eff_H':avg(va_logs,'eff_H')}
         if last is not None: row['program']=last['program']
+        save_diag(out,last,last_y)
         rows.append(row); print(json.dumps(row,ensure_ascii=False)[:1600],flush=True)
         if va_acc>best: best=va_acc; torch.save({'model':model.state_dict(),'args':vars(args),'row':row},out/'best.pt'); print(f'best={best:.4f}',flush=True)
         keys=[k for k in rows[0] if k!='program']
