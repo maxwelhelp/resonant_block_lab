@@ -338,18 +338,23 @@ class ProgramInterventionPolicy:
         self.last_action = {'action': 'init'}
 
     def update_archive(self, model, val_acc: float):
-        if val_acc > self.best_acc:
+        improved = val_acc > self.best_acc
+        if improved:
             self.best_acc = float(val_acc)
             self.bad_epochs = 0
             self.best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             self.last_action = {'action': 'archive_best', 'best_acc': self.best_acc}
         else:
             self.bad_epochs += 1
+        return improved
 
     def apply(self, model, summary: Dict[str, Any], val_acc: float, mode: str = 'diagnostic') -> Dict[str, Any]:
-        self.update_archive(model, val_acc)
+        improved = self.update_archive(model, val_acc)
         if mode in ('off', 'diagnostic'):
             self.last_action = {'action': 'observe_only', 'bad_epochs': self.bad_epochs, 'best_acc': self.best_acc}
+            return self.last_action
+        if improved:
+            self.last_action = {'action': 'archive_best_no_intervention', 'bad_epochs': self.bad_epochs, 'best_acc': self.best_acc}
             return self.last_action
         bank = find_resonant_bank(model)
         if bank is None:
