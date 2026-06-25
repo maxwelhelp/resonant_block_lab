@@ -255,3 +255,128 @@ def render_program_dynamics_md(s: Dict[str, Any], best_acc: float, row_acc: floa
             lines.append(f'- {k}: {s[k]:.6f}')
     lines.append('')
     return '\n'.join(lines)
+
+
+def find_resonant_bank(model):
+    """Return DynamicOperatorBank1D from supported model wrappers, or None."""
+    if hasattr(model, 'res') and getattr(model, 'res') is not None and hasattr(model.res, 'bank'):
+        return model.res.bank
+    if hasattr(model, 'block') and getattr(model, 'block') is not None and hasattr(model.block, 'bank'):
+        return model.block.bank
+    return None
+
+
+def counterfactual_mode_credit(model, x, y, loss_eval_fn, max_modes: int | None = None) -> Dict[str, Any]:
+    """True mode ablation credit on one mini-batch.
+
+    For each mode r: temporarily zero its executable contribution, run forward,
+    and compare ablated loss/accuracy against the base forward.
+
+    gain_loss > 0 means disabling the mode made loss worse => mode helped.
+    gain_acc  > 0 means disabling the mode reduced accuracy => mode helped.
+    """
+    bank = find_resonant_bank(model)
+    if bank is None or not hasattr(bank, 'mode_scale'):
+        return {'enabled': False, 'reason': 'no_resonant_bank'}
+    n_modes = int(bank.mode_scale.numel())
+    if max_modes is not None and max_modes > 0:
+        n_modes = min(n_modes, int(max_modes))
+    mode_names = ProgramBrain()._names(int(bank.mode_scale.numel()))
+    with torch.no_grad():
+        base_logits, base_stats = model(x, return_stats=True)
+        base_loss = float(loss_eval_fn(base_logits, base_stats, y).detach().float().cpu())
+        base_acc = float((base_logits.argmax(-1) == y).float().mean().detach().cpu())
+        rows = []
+        for r in range(n_modes):
+            scale_old = bank.mode_scale.data[r].clone()
+            bias_old = bank.mode_bias.data[r].clone()
+            try:
+                bank.mode_scale.data[r].zero_()
+                bank.mode_bias.data[r].zero_()
+                logits, stats = model(x, return_stats=True)
+                loss = float(loss_eval_fn(logits, stats, y).detach().float().cpu())
+                acc = float((logits.argmax(-1) == y).float().mean().detach().cpu())
+            finally:
+                bank.mode_scale.data[r].copy_(scale_old)
+                bank.mode_bias.data[r].copy_(bias_old)
+            rows.append({
+                'mode': mode_names[r],
+                'mode_idx': r,
+                'base_loss': base_loss,
+                'ablated_loss': loss,
+                'gain_loss': loss - base_loss,
+                'base_acc': base_acc,
+                'ablated_acc': acc,
+                'gain_acc': base_acc - acc,
+            })
+    helpful = sorted(rows, key=lambda z: (z['gain_loss'], z['gain_acc']), reverse=True)
+    harmful = sorted(rows, key=lambda z: (z['gain_loss'], z['gain_acc']))
+    return {
+        'enabled': True,
+        'base_loss': base_loss,
+        'base_acc': base_acc,
+        'rows': rows,
+        'helpful_modes_true': helpful[:5],
+        'harmful_modes_true': harmful[:5],
+    }
+
+
+class ProgramInterventionPolicy:
+    """Small optional controller for burst / suppress / rollback decisions.
+
+    This intentionally does not mutate architecture by default. The caller must invoke
+    apply() after validation, and can disable it via CLI. Policy uses true credit when
+    available, then falls back to proxy credit.
+    """
+    def __init__(self, patience: int = 2, burst_scale: float = 0.035, suppress_scale: float = 0.03):
+        self.patience = int(patience)
+        self.burst_scale = float(burst_scale)
+        self.suppress_scale = float(suppress_scale)
+        self.best_acc = -1.0
+        self.bad_epochs = 0
+        self.best_state = None
+        self.last_action = {'action': 'init'}
+
+    def update_archive(self, model, val_acc: float):
+        if val_acc > self.best_acc:
+            self.best_acc = float(val_acc)
+            self.bad_epochs = 0
+            self.best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            self.last_action = {'action': 'archive_best', 'best_acc': self.best_acc}
+        else:
+            self.bad_epochs += 1
+
+    def apply(self, model, summary: Dict[str, Any], val_acc: float, mode: str = 'diagnostic') -> Dict[str, Any]:
+        self.update_archive(model, val_acc)
+        if mode in ('off', 'diagnostic'):
+            self.last_action = {'action': 'observe_only', 'bad_epochs': self.bad_epochs, 'best_acc': self.best_acc}
+            return self.last_action
+        bank = find_resonant_bank(model)
+        if bank is None:
+            self.last_action = {'action': 'no_bank'}
+            return self.last_action
+        true_credit = summary.get('true_counterfactual_credit') or {}
+        rows = true_credit.get('rows') or []
+        action = {'action': 'none', 'bad_epochs': self.bad_epochs, 'best_acc': self.best_acc}
+        if self.bad_epochs >= self.patience and self.best_state is not None and mode in ('rollback', 'active'):
+            model.load_state_dict(self.best_state, strict=True)
+            self.bad_epochs = 0
+            action = {'action': 'rollback_to_best', 'best_acc': self.best_acc}
+        elif mode in ('active','act','on') and rows:
+            helpful = [r for r in rows if r.get('gain_loss', 0.0) > 0]
+            harmful = [r for r in rows if r.get('gain_loss', 0.0) < 0]
+            with torch.no_grad():
+                if harmful:
+                    h = min(harmful, key=lambda z: z['gain_loss'])
+                    idx = int(h['mode_idx'])
+                    bank.mode_scale[idx].mul_(max(0.0, 1.0 - self.suppress_scale))
+                    action = {'action': 'suppress_harmful_mode', 'mode': h['mode'], 'gain_loss': h['gain_loss']}
+                if helpful:
+                    h = max(helpful, key=lambda z: z['gain_loss'])
+                    idx = int(h['mode_idx'])
+                    bank.mode_scale[idx].mul_(1.0 + self.burst_scale)
+                    action = {'action': 'boost_helpful_mode', 'mode': h['mode'], 'gain_loss': h['gain_loss'], 'previous': action}
+        self.last_action = action
+        return action
+
+ActionPolicy = ProgramInterventionPolicy

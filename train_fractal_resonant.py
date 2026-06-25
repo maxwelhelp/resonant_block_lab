@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from resonant_block_lab.fractal_sequence import FractalResonantSequenceClassifier
-from resonant_block_lab.program_brain import ProgramBrain, write_program_brain_outputs
+from resonant_block_lab.program_brain import ProgramBrain, ProgramInterventionPolicy, counterfactual_mode_credit, write_program_brain_outputs
 
 class SeqProgramDataset(Dataset):
     def __init__(self, n=12000, length=128, input_dim=16, classes=8, seed=1, noise=0.24):
@@ -63,7 +63,7 @@ def avg(rows,k):
     return sum(vals)/max(1,len(vals))
 
 def run_epoch(model,loader,opt,args,device,train=True):
-    model.train(train); ok=tot=0; logs=[]; last=None; last_y=None; brain=ProgramBrain() if not train else None
+    model.train(train); ok=tot=0; logs=[]; last=None; last_y=None; brain=ProgramBrain() if not train else None; credit_x=None; credit_y=None; brain=ProgramBrain() if not train else None
     for bi,(x,y) in enumerate(loader,1):
         x=x.to(device,non_blocking=True); y=y.to(device,non_blocking=True)
         with torch.set_grad_enabled(train):
@@ -74,6 +74,9 @@ def run_epoch(model,loader,opt,args,device,train=True):
         ok+=(logits.argmax(-1)==y).sum().item(); tot+=y.numel(); last=stats; last_y=y.detach().cpu()
         if brain is not None:
             brain.add(stats, y, logits)
+            if credit_x is None:
+                credit_x=x.detach()
+                credit_y=y.detach()
         rec={k:float(v.detach().cpu()) for k,v in ls.items()}
         rec.update({'macc':acc_last(stats,y,'macro_logits'),'uacc':acc_last(stats,y,'micro_logits'),
                     'alpha':float(stats['gate_history'][:,0].mean().detach().cpu()),
@@ -86,7 +89,7 @@ def run_epoch(model,loader,opt,args,device,train=True):
         logs.append(rec)
         if train and args.log_every and bi%args.log_every==0:
             print(f"batch {bi:4d}/{len(loader)} loss={float(loss.detach()):.3f} ce={rec['ce']:.3f} attr={rec['attr_ce']:.3f} macro={rec['macro_ce']:.3f} micro={rec['micro_ce']:.3f} macc={rec['macc']:.3f} uacc={rec['uacc']:.3f} alpha={rec['alpha']:.3f} H={rec['eff_H']:.3f}",flush=True)
-    return ok/max(1,tot), logs, last, last_y, brain
+    return ok/max(1,tot), logs, last, last_y, brain, credit_x, credit_y
 
 def save_diag(out, stats, y):
     if stats is None or y is None: return
@@ -133,6 +136,8 @@ def main():
     p.add_argument('--w_skip',type=float,default=0.02); p.add_argument('--w_smooth',type=float,default=0.02); p.add_argument('--alpha_min',type=float,default=0.20); p.add_argument('--margin',type=float,default=0.08)
     p.add_argument('--use_ff_refine',action='store_true'); p.add_argument('--head_mode',default='attractor_only',choices=['attractor_only','hybrid','linear_only']); p.add_argument('--device',default='cuda' if torch.cuda.is_available() else 'cpu')
     p.add_argument('--out_dir',default='runs/fractal_resonant_full'); p.add_argument('--log_every',type=int,default=25)
+    p.add_argument('--credit_modes',type=int,default=8); p.add_argument('--program_action_mode',default='diagnostic')
+    p.add_argument('--action_patience',type=int,default=2); p.add_argument('--burst_scale',type=float,default=0.035); p.add_argument('--dampen_scale',type=float,default=0.03)
     args=p.parse_args(); device=torch.device(args.device if args.device=='cpu' or torch.cuda.is_available() else 'cpu')
     out=Path(args.out_dir); out.mkdir(parents=True,exist_ok=True); (out/'config.json').write_text(json.dumps(vars(args),indent=2,ensure_ascii=False))
     tr=DataLoader(SeqProgramDataset(args.train_n,args.length,args.input_dim,args.classes,1,args.noise),batch_size=args.batch,shuffle=True,pin_memory=device.type=='cuda')
@@ -141,8 +146,9 @@ def main():
     opt=torch.optim.AdamW(model.parameters(),lr=args.lr,weight_decay=1e-4)
     print('params',sum(p.numel() for p in model.parameters() if p.requires_grad),flush=True)
     rows=[]; best=0.0
+    policy=globals()['Program'+'InterventionPolicy'](args.action_patience,args.burst_scale,args.dampen_scale)
     for ep in range(1,args.epochs+1):
-        t=time.time(); tr_acc,tr_logs,_,_,_=run_epoch(model,tr,opt,args,device,True); va_acc,va_logs,last,last_y,brain=run_epoch(model,va,opt,args,device,False)
+        t=time.time(); tr_acc,tr_logs,_,_,_,_,_=run_epoch(model,tr,opt,args,device,True); va_acc,va_logs,last,last_y,brain,credit_x,credit_y=run_epoch(model,va,opt,args,device,False)
         row={'epoch':ep,'train_acc':tr_acc,'val_acc':va_acc,'sec':time.time()-t,
              'train_ce':avg(tr_logs,'ce'),'train_attr_ce':avg(tr_logs,'attr_ce'),'train_macro_ce':avg(tr_logs,'macro_ce'),'train_micro_ce':avg(tr_logs,'micro_ce'),
              'train_macc':avg(tr_logs,'macc'),'train_uacc':avg(tr_logs,'uacc'),'train_alpha':avg(tr_logs,'alpha'),'train_beta':avg(tr_logs,'beta'),
@@ -156,9 +162,16 @@ def main():
         save_diag(out,last,last_y)
         if brain is not None:
             summary=brain.finalize(ep,row)
+            if credit_x is not None and args.credit_modes != 0:
+                def _eval_loss(logits,stats,yy):
+                    return loss_fn(logits,stats,yy,args,model)[0]
+                summary['true_counterfactual_credit']=counterfactual_mode_credit(model,credit_x,credit_y,_eval_loss,args.credit_modes)
             write_program_brain_outputs(out,summary,best_acc=best,row_acc=va_acc)
         rows.append(row); print(json.dumps(row,ensure_ascii=False)[:1600],flush=True)
         if va_acc>best: best=va_acc; torch.save({'model':model.state_dict(),'args':vars(args),'row':row},out/'best.pt'); print(f'best={best:.4f}',flush=True)
+        if summary is not None:
+            summary['policy_action']=policy.apply(model,summary,va_acc,args.program_action_mode)
+            write_program_brain_outputs(out,summary,best_acc=best,row_acc=va_acc)
         keys=[k for k in rows[0] if k!='program']
         with (out/'history.csv').open('w',newline='') as f:
             w=csv.DictWriter(f,fieldnames=keys); w.writeheader(); [w.writerow({k:r.get(k) for k in keys}) for r in rows]
