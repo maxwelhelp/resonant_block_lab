@@ -128,7 +128,9 @@ class FractalResonantSequenceBlock(nn.Module):
         psi = x
         init = x
         b, l, d = x.shape
-        memory = torch.zeros(b, d, device=x.device, dtype=x.dtype)
+        ctx_keys = self.reader.k(context)
+        ctx_values = self.reader.v(context)
+        macro_memory_state = torch.zeros(b, d, device=x.device, dtype=x.dtype)
 
         macro_states, micro_states = [], []
         macro_logits, micro_logits = [], []
@@ -136,23 +138,24 @@ class FractalResonantSequenceBlock(nn.Module):
         macro_delta_hist, micro_delta_hist, ent_hist = [], [], []
 
         for t in range(self.config.macro_steps):
-            macro_ctx, macro_ent = self.reader(psi, context)
-            macro_cfg = self.controller(psi.mean(1), macro_ctx, memory, t, 0, level_id=0)
-            memory = macro_cfg['memory']
+            macro_ctx, macro_ent = self.reader.read_precomputed(psi, ctx_keys, ctx_values)
+            macro_cfg = self.controller(psi.mean(1), macro_ctx, macro_memory_state, t, 0, level_id=0)
+            macro_memory_state = macro_cfg['memory']
             macro_q = macro_cfg['macro_q']
             macro_plan_q_hist.append(macro_q)
+            micro_memory = macro_memory_state
             old_macro = psi
             phi = psi
 
             for m in range(self.config.micro_steps):
-                ctx, ent = self.reader(phi, context)
-                cfg = self.controller(phi.mean(1), ctx, memory, t, m, level_id=1)
+                ctx, ent = self.reader.read_precomputed(phi, ctx_keys, ctx_values)
+                cfg = self.controller(phi.mean(1), ctx, micro_memory, t, m, level_id=1)
                 old = phi
                 gates = cfg['gates']
                 micro_q = cfg['micro_q']
-                macro_q_for_update = cfg['macro_q']
-                phi = self._update(phi, init, ctx, memory, macro_q_for_update, micro_q, gates)
-                memory = cfg['memory']
+                macro_q_for_update = macro_q
+                phi = self._update(phi, init, ctx, macro_memory_state, macro_q_for_update, micro_q, gates)
+                micro_memory = cfg['memory']
 
                 if self.affine_projector is not None:
                     micro_logits.append(self.affine_projector(self.features(phi)))

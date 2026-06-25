@@ -29,14 +29,15 @@ class CrossReader(nn.Module):
         self.v = nn.Linear(dim, dim, bias=False)
         self.dim = int(dim)
 
-    def forward(self, field: torch.Tensor, context: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def read_precomputed(self, field: torch.Tensor, keys: torch.Tensor, values: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         query = self.q(field.mean(dim=1)).unsqueeze(1)
-        keys = self.k(context)
-        values = self.v(context)
         attn = torch.softmax(torch.bmm(query, keys.transpose(1, 2)) / math.sqrt(self.dim), dim=-1)
         ctx = torch.bmm(attn, values).squeeze(1)
         ent = -(attn.squeeze(1).clamp_min(1e-8).log() * attn.squeeze(1)).sum(dim=-1).mean()
         return ctx, ent
+
+    def forward(self, field: torch.Tensor, context: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.read_precomputed(field, self.k(context), self.v(context))
 
 
 class DynamicOperatorBank1D(nn.Module):
@@ -45,8 +46,11 @@ class DynamicOperatorBank1D(nn.Module):
         super().__init__()
         self.dim = int(dim)
         self.n_modes = int(n_modes)
-        extra = max(1, n_modes - 5)
+        self.n_fixed_modes = 6
+        extra = max(0, n_modes - self.n_fixed_modes)
         self.dw = nn.ModuleList([nn.Conv1d(dim, dim, 3, padding=1, groups=dim, bias=False) for _ in range(extra)])
+        self.mode_scale = nn.Parameter(torch.ones(n_modes))
+        self.mode_bias = nn.Parameter(torch.zeros(n_modes, 1, dim))
         for conv in self.dw:
             nn.init.zeros_(conv.weight)
             with torch.no_grad():
@@ -84,7 +88,9 @@ class DynamicOperatorBank1D(nn.Module):
         return torch.stack(ops[:self.n_modes], dim=1)
 
     def mix(self, x: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
-        return torch.einsum('br,brld->bld', q, self.apply_all(x))
+        ops = self.apply_all(x)
+        ops = ops * self.mode_scale.view(1, -1, 1, 1) + self.mode_bias.view(1, self.n_modes, 1, self.dim)
+        return torch.einsum('br,brld->bld', q, ops)
 
     def replay_description(self, q: torch.Tensor, topk: int = 4) -> Dict:
         names = ['identity', 'shift_left', 'shift_right', 'local_avg', 'global_mean', 'highpass']
