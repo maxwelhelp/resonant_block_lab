@@ -23,6 +23,13 @@ class FractalResonantConfig:
     max_macro_steps: int = 64
     max_micro_steps: int = 16
     use_ff_refine: bool = False
+    mix_topk: int = 0
+    enable_matrix_program: bool = False
+    enable_symbolic_product: bool = False
+    enable_lowrank: bool = False
+    enable_input_primitive: bool = False
+    program_steps: int = 2
+    program_rank: int = 8
 
 
 class UnifiedFractalController(nn.Module):
@@ -83,7 +90,15 @@ class FractalResonantSequenceBlock(nn.Module):
         self.config = config
         d = config.dim
         self.reader = CrossReader(d)
-        self.bank = DynamicOperatorBank1D(d, config.n_modes)
+        self.bank = DynamicOperatorBank1D(
+            d, config.n_modes,
+            enable_symbolic_additive=config.enable_matrix_program,
+            enable_symbolic_product=config.enable_symbolic_product,
+            enable_lowrank=config.enable_lowrank,
+            enable_input_primitive=config.enable_input_primitive,
+            program_steps=config.program_steps,
+            program_rank=config.program_rank,
+        )
         self.controller = UnifiedFractalController(
             d, config.n_modes, config.controller_hidden, config.max_macro_steps, config.max_micro_steps
         )
@@ -110,7 +125,7 @@ class FractalResonantSequenceBlock(nn.Module):
         rho = gates[:, 4].view(b, 1, 1)
         macro_mix = gates[:, 5].view(b, 1)
         q_eff = F.normalize(macro_mix * macro_q + (1.0 - macro_mix) * micro_q, p=1, dim=-1)
-        mixed = self.bank.mix(phi, q_eff)
+        mixed = self.bank.mix_topk(phi, q_eff, self.config.mix_topk) if self.config.mix_topk else self.bank.mix(phi, q_eff)
         update = torch.tanh(
             gamma * self.state_proj(mixed)
             + beta * self.input_proj(ctx[:, None, :].expand(b, l, d))
@@ -256,7 +271,10 @@ class FractalResonantSequenceClassifier(nn.Module):
     """Resonant-only classifier: no parallel fallback as a hidden crutch."""
     def __init__(self, input_dim: int, dim: int, n_classes: int,
                  n_modes: int = 8, macro_steps: int = 8, micro_steps: int = 3,
-                 use_ff_refine: bool = False, head_mode: str = 'attractor_only'):
+                 use_ff_refine: bool = False, head_mode: str = 'attractor_only', mix_topk: int = 0,
+                 enable_matrix_program: bool = False, enable_symbolic_product: bool = False,
+                 enable_lowrank: bool = False, enable_input_primitive: bool = False,
+                 program_steps: int = 2, program_rank: int = 8):
         super().__init__()
         self.in_proj = nn.Linear(input_dim, dim)
         cfg = FractalResonantConfig(
@@ -266,6 +284,13 @@ class FractalResonantSequenceClassifier(nn.Module):
             micro_steps=micro_steps,
             aux_classes=n_classes,
             use_ff_refine=use_ff_refine,
+            mix_topk=int(mix_topk),
+            enable_matrix_program=bool(enable_matrix_program),
+            enable_symbolic_product=bool(enable_symbolic_product),
+            enable_lowrank=bool(enable_lowrank),
+            enable_input_primitive=bool(enable_input_primitive),
+            program_steps=int(program_steps),
+            program_rank=int(program_rank),
         )
         self.block = FractalResonantSequenceBlock(cfg)
         self.head = SequenceAttractorHead(n_classes, dim, head_mode=head_mode)

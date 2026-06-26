@@ -45,7 +45,7 @@ class SwapClassifier(nn.Module):
         else:
             self.attn=None
         if self.variant in ('res_before_attn','res_instead_attn','attn_then_res'):
-            cfg=FractalResonantConfig(dim=D,n_modes=args.n_modes,macro_steps=args.macro_steps,micro_steps=args.micro_steps,aux_classes=args.classes,controller_hidden=args.controller_hidden,use_ff_refine=args.use_ff_refine)
+            cfg=FractalResonantConfig(dim=D,n_modes=args.n_modes,macro_steps=args.macro_steps,micro_steps=args.micro_steps,aux_classes=args.classes,controller_hidden=args.controller_hidden,use_ff_refine=args.use_ff_refine,mix_topk=args.mix_topk,enable_matrix_program=args.enable_matrix_program,enable_symbolic_product=args.enable_symbolic_product,enable_lowrank=args.enable_lowrank,enable_input_primitive=args.enable_input_primitive,program_steps=args.program_steps,program_rank=args.program_rank)
             self.res=FractalResonantSequenceBlock(cfg)
         else:
             self.res=None
@@ -154,7 +154,10 @@ def main():
     p.add_argument('--input_dim',type=int,default=16); p.add_argument('--dim',type=int,default=64); p.add_argument('--classes',type=int,default=8)
     p.add_argument('--heads',type=int,default=4); p.add_argument('--n_modes',type=int,default=8); p.add_argument('--macro_steps',type=int,default=8); p.add_argument('--micro_steps',type=int,default=3)
     p.add_argument('--controller_hidden',type=int,default=192); p.add_argument('--train_n',type=int,default=12000); p.add_argument('--val_n',type=int,default=2000); p.add_argument('--noise',type=float,default=0.24)
-    p.add_argument('--head_mode',default='attractor_only',choices=['attractor_only','hybrid','linear_only']); p.add_argument('--use_ff_refine',action='store_true')
+    p.add_argument('--head_mode',default='attractor_only',choices=['attractor_only','hybrid','linear_only']); p.add_argument('--mix_topk',type=int,default=0); p.add_argument('--use_ff_refine',action='store_true')
+    p.add_argument('--enable_matrix_program',action='store_true'); p.add_argument('--enable_symbolic_product',action='store_true')
+    p.add_argument('--enable_lowrank',action='store_true'); p.add_argument('--enable_input_primitive',action='store_true')
+    p.add_argument('--program_steps',type=int,default=2); p.add_argument('--program_rank',type=int,default=8)
     p.add_argument('--lr',type=float,default=3e-4); p.add_argument('--w_attr',type=float,default=0.25); p.add_argument('--w_macro',type=float,default=0.35); p.add_argument('--w_micro',type=float,default=0.30)
     p.add_argument('--w_margin',type=float,default=0.05); p.add_argument('--w_sep',type=float,default=0.02); p.add_argument('--w_energy',type=float,default=0.01); p.add_argument('--w_skip',type=float,default=0.02); p.add_argument('--w_smooth',type=float,default=0.02)
     p.add_argument('--alpha_min',type=float,default=0.20); p.add_argument('--margin',type=float,default=0.08); p.add_argument('--device',default='cuda' if torch.cuda.is_available() else 'cpu')
@@ -170,7 +173,7 @@ def main():
     rows=[]; best=0.0
     policy=ProgramInterventionPolicy(args.intervention_patience,args.burst_scale,args.dampen_scale)
     for ep in range(1,args.epochs+1):
-        t=time.time(); tr_acc,tr_logs,_,_,_=run_epoch(model,tr,opt,args,device,True); va_acc,va_logs,last,last_y,brain=run_epoch(model,va,opt,args,device,False)
+        t=time.time(); tr_acc,tr_logs,_,_,_,_,_=run_epoch(model,tr,opt,args,device,True); va_acc,va_logs,last,last_y,brain,credit_x,credit_y=run_epoch(model,va,opt,args,device,False)
         row={'epoch':ep,'variant':args.variant,'train_acc':tr_acc,'val_acc':va_acc,'sec':time.time()-t,'train_ce':avg(tr_logs,'ce'),'train_macro_ce':avg(tr_logs,'macro_ce'),'train_micro_ce':avg(tr_logs,'micro_ce'),'train_macc':avg(tr_logs,'macc'),'train_uacc':avg(tr_logs,'uacc'),'train_alpha':avg(tr_logs,'alpha'),'val_ce':avg(va_logs,'ce'),'val_macro_ce':avg(va_logs,'macro_ce'),'val_micro_ce':avg(va_logs,'micro_ce'),'val_macc':avg(va_logs,'macc'),'val_uacc':avg(va_logs,'uacc'),'val_alpha':avg(va_logs,'alpha')}
         if last and 'program' in last: row['program']=last['program']
         rows.append(row); save_diag(out,last,last_y)
@@ -180,9 +183,16 @@ def main():
                 def _eval_loss(logits,stats,yy):
                     return loss_fn(model,logits,stats,yy,args)[0]
                 summary['true_counterfactual_credit']=counterfactual_mode_credit(model,credit_x,credit_y,_eval_loss,args.credit_modes)
+            if credit_x is not None and args.credit_modes != 0:
+                def _eval_loss(logits,stats,yy):
+                    return loss_fn(model,logits,stats,yy,args)[0]
+                summary['true_counterfactual_credit']=counterfactual_mode_credit(model,credit_x,credit_y,_eval_loss,args.credit_modes)
             write_program_brain_outputs(out,summary,best_acc=best,row_acc=va_acc)
         print(json.dumps(row,ensure_ascii=False)[:1600],flush=True)
         if va_acc>best: best=va_acc; torch.save({'model':model.state_dict(),'args':vars(args),'row':row},out/'best.pt'); print('best',best,flush=True)
+        if summary is not None:
+            summary['policy_action']=policy.apply(model,summary,va_acc,args.intervention_mode)
+            write_program_brain_outputs(out,summary,best_acc=best,row_acc=va_acc)
         if summary is not None:
             summary['policy_action']=policy.apply(model,summary,va_acc,args.intervention_mode)
             write_program_brain_outputs(out,summary,best_acc=best,row_acc=va_acc)

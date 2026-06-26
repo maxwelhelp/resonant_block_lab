@@ -41,20 +41,74 @@ class CrossReader(nn.Module):
 
 
 class DynamicOperatorBank1D(nn.Module):
-    """Replayable sequence operator bank for dynamic length [B,L,D]."""
-    def __init__(self, dim: int, n_modes: int):
+    """Replayable sequence operator bank for dynamic length [B,L,D].
+
+    The first modes are readable fixed operators. Optional matrix-program families
+    can occupy the next free modes:
+      - symbolic_additive: W = sum_i c_i O_i
+      - symbolic_product: W = prod_s (I + step_s * sum_i c_si O_i)
+      - low_rank_global: cheap global learned low-rank summary
+      - input_conditioned: primitive generated directly from current input statistics
+
+    This keeps the controller idea intact: the controller routes over modes, but
+    some modes are themselves small matrix-program compilers.
+    """
+    def __init__(self, dim: int, n_modes: int, *,
+                 enable_symbolic_additive: bool = False,
+                 enable_symbolic_product: bool = False,
+                 enable_lowrank: bool = False,
+                 enable_input_primitive: bool = False,
+                 program_steps: int = 2,
+                 program_rank: int = 8):
         super().__init__()
         self.dim = int(dim)
         self.n_modes = int(n_modes)
         self.n_fixed_modes = 6
-        extra = max(0, n_modes - self.n_fixed_modes)
-        self.dw = nn.ModuleList([nn.Conv1d(dim, dim, 3, padding=1, groups=dim, bias=False) for _ in range(extra)])
+        self.program_steps = int(program_steps)
+        self.program_rank = int(program_rank)
+        self.enable_symbolic_additive = bool(enable_symbolic_additive)
+        self.enable_symbolic_product = bool(enable_symbolic_product)
+        self.enable_lowrank = bool(enable_lowrank)
+        self.enable_input_primitive = bool(enable_input_primitive)
+
+        names = ['identity', 'shift_left', 'shift_right', 'local_avg', 'global_mean', 'highpass']
+        if self.enable_symbolic_additive and len(names) < self.n_modes:
+            names.append('symbolic_additive')
+        if self.enable_symbolic_product and len(names) < self.n_modes:
+            names.append('symbolic_product')
+        if self.enable_lowrank and len(names) < self.n_modes:
+            names.append('low_rank_global')
+        if self.enable_input_primitive and len(names) < self.n_modes:
+            names.append('input_conditioned')
+        learned_count = 0
+        while len(names) < self.n_modes:
+            learned_count += 1
+            names.append(f'learned_depthwise_{learned_count}')
+        self.mode_names = names[:self.n_modes]
+        self.learned_indices = [i for i,n in enumerate(self.mode_names) if n.startswith('learned_depthwise_')]
+        self.dw = nn.ModuleList([nn.Conv1d(dim, dim, 3, padding=1, groups=dim, bias=False) for _ in self.learned_indices])
+
         self.mode_scale = nn.Parameter(torch.ones(n_modes))
         self.mode_bias = nn.Parameter(torch.zeros(n_modes, 1, dim))
+        self.mode_logit_bias = nn.Parameter(torch.zeros(n_modes))
+
+        # Matrix-program parameters. They are only used if their mode exists.
+        self.symbolic_additive_logits = nn.Parameter(torch.zeros(self.n_fixed_modes))
+        self.symbolic_product_logits = nn.Parameter(torch.zeros(self.program_steps, self.n_fixed_modes))
+        self.symbolic_product_step = nn.Parameter(torch.full((self.program_steps,), -1.4))
+        r = max(1, min(self.program_rank, dim))
+        self.low_down = nn.Linear(dim, r, bias=False)
+        self.low_up = nn.Linear(r, dim, bias=False)
+        self.input_gate = nn.Sequential(nn.LayerNorm(dim * 4), nn.Linear(dim * 4, dim), nn.Sigmoid())
+
         for conv in self.dw:
             nn.init.zeros_(conv.weight)
             with torch.no_grad():
                 conv.weight[:, 0, 1] = 1.0
+        with torch.no_grad():
+            # Start product programs close to identity for stability.
+            self.symbolic_additive_logits[0] = 2.0
+            self.symbolic_product_logits[:, 0] = 2.0
 
     @staticmethod
     def shift_left(x):
@@ -68,39 +122,124 @@ class DynamicOperatorBank1D(nn.Module):
     def local_avg(x):
         return (DynamicOperatorBank1D.shift_right(x) + x + DynamicOperatorBank1D.shift_left(x)) / 3.0
 
+    @staticmethod
+    def _features(x):
+        return torch.cat([x.mean(1), x.std(1), x.max(1).values, x.pow(2).mean(1)], dim=-1)
+
+    def base_ops(self, x: torch.Tensor):
+        return [
+            x,
+            self.shift_left(x),
+            self.shift_right(x),
+            self.local_avg(x),
+            x.mean(dim=1, keepdim=True).expand_as(x),
+            x - self.local_avg(x),
+        ]
+
+    def symbolic_additive(self, x: torch.Tensor) -> torch.Tensor:
+        ops = self.base_ops(x)
+        coeff = torch.softmax(self.symbolic_additive_logits, dim=-1)
+        out = torch.zeros_like(x)
+        for c, op in zip(coeff, ops):
+            out = out + c * op
+        return out
+
+    def symbolic_product(self, x: torch.Tensor) -> torch.Tensor:
+        h = x
+        for s in range(self.program_steps):
+            ops = self.base_ops(h)
+            coeff = torch.softmax(self.symbolic_product_logits[s], dim=-1)
+            delta = torch.zeros_like(h)
+            for c, op in zip(coeff, ops):
+                delta = delta + c * op
+            step = 0.35 * torch.tanh(self.symbolic_product_step[s])
+            h = h + step * delta
+        return h
+
+    def low_rank_global(self, x: torch.Tensor) -> torch.Tensor:
+        g = self.low_up(self.low_down(x.mean(dim=1))).unsqueeze(1)
+        return g.expand_as(x)
+
+    def input_conditioned(self, x: torch.Tensor) -> torch.Tensor:
+        gate = self.input_gate(self._features(x)).unsqueeze(1)
+        local = self.local_avg(x)
+        high = x - local
+        return gate * local + (1.0 - gate) * high
+
+    def apply_mode(self, x: torch.Tensor, mode_idx: int) -> torch.Tensor:
+        name = self.mode_names[int(mode_idx)]
+        if name == 'identity': return x
+        if name == 'shift_left': return self.shift_left(x)
+        if name == 'shift_right': return self.shift_right(x)
+        if name == 'local_avg': return self.local_avg(x)
+        if name == 'global_mean': return x.mean(dim=1, keepdim=True).expand_as(x)
+        if name == 'highpass': return x - self.local_avg(x)
+        if name == 'symbolic_additive': return self.symbolic_additive(x)
+        if name == 'symbolic_product': return self.symbolic_product(x)
+        if name == 'low_rank_global': return self.low_rank_global(x)
+        if name == 'input_conditioned': return self.input_conditioned(x)
+        if name.startswith('learned_depthwise_'):
+            j = self.learned_indices.index(int(mode_idx))
+            return self.dw[j](x.transpose(1, 2)).transpose(1, 2)
+        return x
+
     def apply_all(self, x: torch.Tensor) -> torch.Tensor:
-        ops = [x]
-        if len(ops) < self.n_modes:
-            ops.append(self.shift_left(x))
-        if len(ops) < self.n_modes:
-            ops.append(self.shift_right(x))
-        if len(ops) < self.n_modes:
-            ops.append(self.local_avg(x))
-        if len(ops) < self.n_modes:
-            ops.append(x.mean(dim=1, keepdim=True).expand_as(x))
-        if len(ops) < self.n_modes:
-            ops.append(x - self.local_avg(x))
-        i = 0
-        while len(ops) < self.n_modes:
-            conv = self.dw[min(i, len(self.dw) - 1)]
-            ops.append(conv(x.transpose(1, 2)).transpose(1, 2))
-            i += 1
-        return torch.stack(ops[:self.n_modes], dim=1)
+        return torch.stack([self.apply_mode(x, i) for i in range(self.n_modes)], dim=1)
+
+    def route(self, q: torch.Tensor) -> torch.Tensor:
+        q = q.clamp_min(1e-8)
+        return torch.softmax(q.log() + self.mode_logit_bias.view(1, -1), dim=-1)
+
+    def _postprocess_ops(self, ops: torch.Tensor) -> torch.Tensor:
+        return ops * self.mode_scale.view(1, -1, 1, 1) + self.mode_bias.view(1, self.n_modes, 1, self.dim)
 
     def mix(self, x: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
-        ops = self.apply_all(x)
-        ops = ops * self.mode_scale.view(1, -1, 1, 1) + self.mode_bias.view(1, self.n_modes, 1, self.dim)
+        q = self.route(q)
+        ops = self._postprocess_ops(self.apply_all(x))
         return torch.einsum('br,brld->bld', q, ops)
 
+    def mix_topk(self, x: torch.Tensor, q: torch.Tensor, topk: int = 3) -> torch.Tensor:
+        q = self.route(q)
+        k = min(int(topk), self.n_modes)
+        if k <= 0 or k >= self.n_modes:
+            return self.mix(x, q)
+        vals, idx = q.topk(k, dim=-1)
+        vals = vals / vals.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        b = x.shape[0]
+        out = torch.zeros_like(x)
+        # Lazy execution: compute only modes selected by at least one sample.
+        for j in range(k):
+            for mode in idx[:, j].unique().tolist():
+                mask = (idx[:, j] == int(mode))
+                if not bool(mask.any()):
+                    continue
+                op = self.apply_mode(x, int(mode))
+                op = op * self.mode_scale[int(mode)] + self.mode_bias[int(mode)].view(1, 1, self.dim)
+                out[mask] = out[mask] + vals[mask, j].view(-1, 1, 1) * op[mask]
+        return out
+
+    def program_formulas(self) -> Dict:
+        base = ['identity', 'shift_left', 'shift_right', 'local_avg', 'global_mean', 'highpass']
+        coeff = torch.softmax(self.symbolic_additive_logits.detach().float(), dim=-1).cpu()
+        prod = torch.softmax(self.symbolic_product_logits.detach().float(), dim=-1).cpu()
+        steps = torch.tanh(self.symbolic_product_step.detach().float()).cpu() * 0.35
+        return {
+            'mode_names': list(self.mode_names),
+            'symbolic_additive': [(base[i], float(coeff[i])) for i in range(len(base))],
+            'symbolic_product': [
+                {'step': s, 'step_scale': float(steps[s]), 'ops': [(base[i], float(prod[s, i])) for i in range(len(base))]}
+                for s in range(self.program_steps)
+            ],
+            'program_rank': self.program_rank,
+        }
+
     def replay_description(self, q: torch.Tensor, topk: int = 4) -> Dict:
-        names = ['identity', 'shift_left', 'shift_right', 'local_avg', 'global_mean', 'highpass']
-        while len(names) < self.n_modes:
-            names.append(f'learned_depthwise_{len(names)-5}')
         q_mean = q.detach().float().mean(dim=0).cpu()
         vals, idx = q_mean.topk(min(topk, self.n_modes))
         return {
-            'top_modes': [(names[int(i)], float(v)) for v, i in zip(vals, idx)],
-            'all_weights': {names[i]: float(q_mean[i]) for i in range(self.n_modes)},
+            'top_modes': [(self.mode_names[int(i)], float(v)) for v, i in zip(vals, idx)],
+            'all_weights': {self.mode_names[i]: float(q_mean[i]) for i in range(self.n_modes)},
+            'matrix_programs': self.program_formulas(),
         }
 
 

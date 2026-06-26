@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import torch
+from .program_trace import build_interpretable_program, render_program_trace_md
 
 
 def _tolist(x: torch.Tensor, ndigits: int = 6):
@@ -192,10 +193,60 @@ class ProgramBrain:
         return out[:k]
 
 
+
+def residual_primitive_suggestions(summary: Dict[str, Any]) -> Dict[str, Any]:
+    """Suggest new primitives from current errors/credit without mutating the model.
+
+    This is the safe first step of primitive birth: observe where the current bank
+    is weak, then propose a residual atom family to add in the next run.
+    """
+    tc = summary.get('true_counterfactual_credit') or {}
+    rows = tc.get('rows') or []
+    helpful = tc.get('helpful_modes_true') or []
+    harmful = tc.get('harmful_modes_true') or []
+    eff_h = float(summary.get('eff_mode_entropy', 0.0) or 0.0)
+    final_acc = float(summary.get('final_acc', 0.0) or 0.0)
+    suggestions = []
+    if rows:
+        best_gain = max(float(r.get('gain_loss', 0.0)) for r in rows)
+        worst_gain = min(float(r.get('gain_loss', 0.0)) for r in rows)
+        if best_gain < 0.05 and final_acc < 0.90:
+            suggestions.append({
+                'birth_type': 'residual_matrix_program',
+                'reason': 'no existing mode has strong positive counterfactual gain',
+                'init': 'mine validation errors, fit additive operator residual W_res ≈ error_update',
+            })
+        if worst_gain < -0.05:
+            bad = min(rows, key=lambda z: float(z.get('gain_loss', 0.0)))
+            suggestions.append({
+                'birth_type': 'anti_mode_replacement',
+                'reason': f"mode {bad.get('mode')} improves loss when disabled",
+                'init': 'create residual primitive orthogonal to harmful mode activation',
+            })
+    if eff_h > 2.0 and final_acc < 0.95:
+        suggestions.append({
+            'birth_type': 'input_conditioned_basis',
+            'reason': 'routing entropy remains high while accuracy is not saturated',
+            'init': 'cluster input/field features on mistakes and create data-conditioned basis atom',
+        })
+    if helpful:
+        top = helpful[0]
+        suggestions.append({
+            'birth_type': 'specialize_best_mode',
+            'reason': f"best true-credit mode is {top.get('mode')}",
+            'init': 'clone mode into a new primitive and let controller specialize clone on hard examples',
+        })
+    return {'enabled': True, 'suggestions': suggestions[:6]}
+
 def write_program_brain_outputs(out_dir: Path, summary: Dict[str, Any], best_acc: float, row_acc: float):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    summary['residual_primitive_mining'] = residual_primitive_suggestions(summary)
+    (out_dir / 'residual_primitive_suggestions.json').write_text(json.dumps(summary['residual_primitive_mining'], indent=2, ensure_ascii=False), encoding='utf-8')
     (out_dir / 'program_summary.json').write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding='utf-8')
+    trace = build_interpretable_program(summary)
+    (out_dir / 'interpretable_program.json').write_text(json.dumps(trace, indent=2, ensure_ascii=False), encoding='utf-8')
+    (out_dir / 'INTERPRETABLE_PROGRAM.md').write_text(render_program_trace_md(trace), encoding='utf-8')
     md = render_program_dynamics_md(summary, best_acc=best_acc, row_acc=row_acc)
     (out_dir / 'PROGRAM_DYNAMICS.md').write_text(md, encoding='utf-8')
     best_path = out_dir / 'best_program.json'
@@ -375,12 +426,27 @@ class ProgramInterventionPolicy:
                     h = min(harmful, key=lambda z: z['gain_loss'])
                     idx = int(h['mode_idx'])
                     bank.mode_scale[idx].mul_(max(0.0, 1.0 - self.suppress_scale))
+                    if hasattr(bank, 'mode_logit_bias'):
+                        bank.mode_logit_bias[idx].sub_(self.suppress_scale)
                     action = {'action': 'suppress_harmful_mode', 'mode': h['mode'], 'gain_loss': h['gain_loss']}
                 if helpful:
                     h = max(helpful, key=lambda z: z['gain_loss'])
                     idx = int(h['mode_idx'])
                     bank.mode_scale[idx].mul_(1.0 + self.burst_scale)
+                    if hasattr(bank, 'mode_logit_bias'):
+                        bank.mode_logit_bias[idx].add_(self.burst_scale)
                     action = {'action': 'boost_helpful_mode', 'mode': h['mode'], 'gain_loss': h['gain_loss'], 'previous': action}
+        if mode in ('active','act','on') and bank is not None and hasattr(bank, 'mode_logit_bias'):
+            pair_list = summary.get('pair_compatibility_proxy_top') or []
+            if pair_list:
+                names = ProgramBrain()._names(int(bank.mode_logit_bias.numel()))
+                name_to_idx = {n: i for i, n in enumerate(names)}
+                a, b, val = pair_list[0]
+                if a in name_to_idx and b in name_to_idx and float(val) > 0:
+                    with torch.no_grad():
+                        bank.mode_logit_bias[name_to_idx[a]].add_(0.5 * self.burst_scale)
+                        bank.mode_logit_bias[name_to_idx[b]].add_(0.5 * self.burst_scale)
+                    action = {'action': 'relation_pair_bias', 'pair': [a, b], 'score': float(val), 'previous': action}
         self.last_action = action
         return action
 
