@@ -16,6 +16,49 @@ class TargetedProgramSearch:
         self.state=ProgramSearchState()
         self.patience=int(patience); self.burst_duration=int(burst_duration)
         self.collapse_threshold=float(collapse_threshold); self.temperature_mult=float(temperature_mult)
+    def build_intervention(self, summary: Dict[str, Any] | None, mode_names, feedback_summary: Dict[str, Any] | None = None, relation_summary: Dict[str, Any] | None = None, max_targets: int = 4) -> Dict[str, Any]:
+        """Build a safe next-epoch intervention from diagnostics.
+
+        This does not mutate the model. It only asks the already-supported forward
+        intervention hook to slightly bias useful modes at specific effective steps.
+        """
+        st = self.state
+        if not st.in_burst:
+            return {}
+        mode_to_id = {n: i for i, n in enumerate(mode_names or [])}
+        bias = {}
+        targets = []
+        fb = feedback_summary or {}
+        eff_rows = ((fb.get('mode_feedback_top_by_level') or {}).get('effective') or [])
+        for r in eff_rows[:max_targets]:
+            name = r.get('mode')
+            if name in mode_to_id and float(r.get('gain_ema', 0.0)) >= float(r.get('regret_ema', 0.0)):
+                step = int(r.get('step', 0)); mid = mode_to_id[name]
+                bias[f'effective:{step}:{mid}'] = float(bias.get(f'effective:{step}:{mid}', 0.0)) + 0.15
+                targets.append({'level':'effective','step':step,'mode':name,'reason':'feedback_gain'})
+        if relation_summary:
+            for a,b,v in (relation_summary.get('relation_co_pos_top') or [])[:max_targets]:
+                for name in (a,b):
+                    if name in mode_to_id:
+                        # Global gentle bias across all known effective steps.
+                        for r in eff_rows[:max_targets] or [{'step':0}]:
+                            step = int(r.get('step', 0)); mid = mode_to_id[name]
+                            bias[f'effective:{step}:{mid}'] = float(bias.get(f'effective:{step}:{mid}', 0.0)) + 0.05
+                            targets.append({'level':'effective','step':step,'mode':name,'reason':'relation_support'})
+        if not bias:
+            # Cold-start fallback: burst must still do something, but softly.
+            prog = (summary or {}).get('program', {})
+            all_w = prog.get('all_weights') or {}
+            ordered = sorted(all_w.items(), key=lambda kv: float(kv[1]), reverse=True)
+            steps = [int(r.get('step', 0)) for r in eff_rows[:max_targets]] or [0]
+            for name, _ in ordered[:max_targets]:
+                if name in mode_to_id:
+                    for step in steps[:max_targets]:
+                        mid = mode_to_id[name]
+                        bias[f'effective:{step}:{mid}'] = float(bias.get(f'effective:{step}:{mid}', 0.0)) + 0.03
+                        targets.append({'level':'effective','step':step,'mode':name,'reason':'cold_start_usage'})
+        return {'mode_logit_bias': bias, 'search_targets': targets[:max_targets*2], 'source': 'targeted_program_search'}
+
     def update(self, metric:float, summary:Dict[str,Any] | None=None) -> Dict[str,Any]:
         summary=summary or {}; st=self.state
         improved=float(metric)>st.best_metric

@@ -27,6 +27,41 @@ class ModeFeedbackMemory:
             self.regret_ema[level][step,mode] = self.momentum*self.regret_ema[level][step,mode] + (1-self.momentum)*(-g)
         self.count[level][step,mode] += 1
         self.age[level][step,mode] = 0
+
+    def state_dict_json(self):
+        return {
+            'levels': list(self.levels),
+            'n_steps_by_level': self.n_steps_by_level,
+            'n_modes': self.n_modes,
+            'momentum': self.momentum,
+            'gain_ema': {k: v.detach().cpu().tolist() for k, v in self.gain_ema.items()},
+            'regret_ema': {k: v.detach().cpu().tolist() for k, v in self.regret_ema.items()},
+            'count': {k: v.detach().cpu().tolist() for k, v in self.count.items()},
+            'age': {k: v.detach().cpu().tolist() for k, v in self.age.items()},
+        }
+
+    def save_json(self, path):
+        import json
+        from pathlib import Path
+        Path(path).write_text(json.dumps(self.state_dict_json(), indent=2), encoding='utf-8')
+
+    def load_json(self, path):
+        import json
+        from pathlib import Path
+        p = Path(path)
+        if not p.exists():
+            return False
+        obj = json.loads(p.read_text(encoding='utf-8'))
+        for name in ('gain_ema', 'regret_ema', 'count', 'age'):
+            src = obj.get(name, {})
+            dst = getattr(self, name)
+            for lvl, arr in src.items():
+                if lvl in dst:
+                    t = torch.tensor(arr, device=dst[lvl].device, dtype=dst[lvl].dtype)
+                    if tuple(t.shape) == tuple(dst[lvl].shape):
+                        dst[lvl].copy_(t)
+        return True
+
     def summary(self, mode_names=None, topk:int=8) -> Dict[str,Any]:
         names=list(mode_names or [f'mode_{i}' for i in range(self.n_modes)])
         out={'mode_feedback_count': int(sum(int(v.sum().detach().cpu()) for v in self.count.values()))}

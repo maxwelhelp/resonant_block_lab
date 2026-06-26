@@ -192,7 +192,7 @@ def token_acc(logits, y):
     return float((pred[mask] == y[mask]).float().mean().detach().cpu())
 
 
-def run_epoch(model, loader, opt, args, device, train=True):
+def run_epoch(model, loader, opt, args, device, train=True, train_intervention=None):
     model.train(train)
     total_loss = 0.0; total_acc = 0.0; n = 0
     brain = ProgramBrain() if (not train and model.variant == 'res_lm') else None
@@ -201,7 +201,7 @@ def run_epoch(model, loader, opt, args, device, train=True):
     for bi,(x,y) in enumerate(loader,1):
         x=x.to(device); y=y.to(device)
         with torch.set_grad_enabled(train):
-            logits, stats = model(x, return_stats=True)
+            logits, stats = model(x, return_stats=True, intervention=(train_intervention if train else None))
             loss = seq_loss(logits, y)
             # Optional deep supervision on every macro/micro state as token predictor.
             aux = 0.0
@@ -340,6 +340,12 @@ def main():
     ap.add_argument('--credit_batch_size', type=int, default=32)
     ap.add_argument('--enable_mode_relation', action='store_true')
     ap.add_argument('--enable_program_search', action='store_true')
+    ap.add_argument('--enable_program_search_active', action='store_true')
+    ap.add_argument('--enable_relation_rerank', action='store_true')
+    ap.add_argument('--load_self_memory', action='store_true')
+    ap.add_argument('--self_memory_dir', default='')
+    ap.add_argument('--enable_auto_rollback', action='store_true')
+    ap.add_argument('--auto_rollback_patience', type=int, default=3)
     ap.add_argument('--program_search_patience', type=int, default=8)
     ap.add_argument('--program_burst_duration', type=int, default=5)
     ap.add_argument('--program_temperature_mult', type=float, default=1.4)
@@ -375,13 +381,19 @@ def main():
     relation_memory = ModeRelationMemory(n_modes_for_memory, device=device) if args.enable_mode_relation else None
     program_search = TargetedProgramSearch(args.program_search_patience, args.program_burst_duration, args.program_collapse_threshold, args.program_temperature_mult) if args.enable_program_search else None
     out=Path(args.out_dir)/args.variant; out.mkdir(parents=True,exist_ok=True)
+    memory_dir = Path(args.self_memory_dir) if args.self_memory_dir else out
+    if args.load_self_memory:
+        if feedback_memory is not None:
+            print('load_feedback_memory', feedback_memory.load_json(memory_dir/'mode_feedback_memory.json'), flush=True)
+        if relation_memory is not None:
+            print('load_relation_memory', relation_memory.load_json(memory_dir/'mode_relation_memory.json'), flush=True)
     (out/'config.json').write_text(json.dumps({**vars(args), 'corpus_bytes': corpus_bytes}, indent=2))
     archive = BestProgramArchive(out) if args.enable_best_archive else None
-    rows=[]; best=999.0
+    rows=[]; best=999.0; bad_epochs=0; active_train_intervention=None; rollback_events=[]
     print('variant',args.variant,'task',args.task,'bytes',corpus_bytes,'params',sum(p.numel() for p in model.parameters() if p.requires_grad),flush=True)
     for ep in range(1,args.epochs+1):
         t=time.time()
-        tr_loss,tr_acc,_,_,_,_=run_epoch(model,tr,opt,args,device,True)
+        tr_loss,tr_acc,_,_,_,_=run_epoch(model,tr,opt,args,device,True, active_train_intervention)
         va_loss,va_acc,brain,token_brain,credit_x,credit_y=run_epoch(model,va,opt,args,device,False)
         row={'epoch':ep,'train_loss':tr_loss,'train_acc':tr_acc,'val_loss':va_loss,'val_acc':va_acc,'ppl':math.exp(min(20,va_loss)),'sec':time.time()-t}
         # Memory costs are already included in loss during training. Compact values live in PROGRAM_DYNAMICS via stats.
@@ -413,15 +425,36 @@ def main():
             
             if program_search is not None:
                 summary['program_search'] = program_search.update(va_acc, summary)
+                if args.enable_program_search_active:
+                    relation_summary = summary if args.enable_relation_rerank else None
+                    active_train_intervention = program_search.build_intervention(summary, mode_names, summary, relation_summary)
+                    summary['active_train_intervention_next'] = active_train_intervention
+                else:
+                    active_train_intervention = None
             write_program_brain_outputs(out, summary, best_acc=-best, row_acc=va_acc)
         if va_loss < best:
-            best=va_loss; torch.save({'model':model.state_dict(),'args':vars(args),'row':row},out/'best.pt')
+            best=va_loss; bad_epochs=0; torch.save({'model':model.state_dict(),'args':vars(args),'row':row},out/'best.pt')
             try:
                 if archive is not None and brain is not None:
                     archive.maybe_update(ep, va_loss, va_acc, model, summary if 'summary' in locals() else {}, row)
             except Exception as e:
                 print('archive_warn', repr(e), flush=True)
             print('best_loss',best,flush=True)
+        else:
+            bad_epochs += 1
+            if args.enable_auto_rollback and bad_epochs >= args.auto_rollback_patience and (out/'best.pt').exists():
+                ckpt=torch.load(out/'best.pt', map_location=device)
+                model.load_state_dict(ckpt['model'])
+                opt=torch.optim.AdamW(model.parameters(),lr=args.lr,weight_decay=args.weight_decay)
+                rollback_events.append({'epoch':ep,'to_best_loss':best,'reason':'patience'})
+                print('auto_rollback_to_best', best, 'at_epoch', ep, flush=True)
+                bad_epochs=0
+        if feedback_memory is not None:
+            feedback_memory.save_json(out/'mode_feedback_memory.json')
+        if relation_memory is not None:
+            relation_memory.save_json(out/'mode_relation_memory.json')
+        if rollback_events:
+            (out/'rollback_events.json').write_text(json.dumps(rollback_events, indent=2), encoding='utf-8')
         with (out/'history.csv').open('w',newline='') as f:
             w=csv.DictWriter(f,fieldnames=list(rows[0].keys())); w.writeheader(); w.writerows(rows)
     print('saved',out,'best_loss',best,flush=True)
