@@ -160,21 +160,21 @@ class DynamicOperatorBank1D(nn.Module):
         return out
 
     def learned_causal_pool(self, x: torch.Tensor) -> torch.Tensor:
-        # Mixture of causal exponential moving averages. This can discover
-        # previous-token-like or longer-context behavior without hand naming it.
+        # Fast vectorized causal window pool. It still learns the scale, but avoids
+        # Python loops over sequence positions. Complexity is O(num_scales * BLD),
+        # not O(num_scales * L Python tensor ops).
         mix = torch.softmax(self.causal_pool_logits, dim=-1).to(dtype=x.dtype, device=x.device)
-        outs = []
-        for scale in self.causal_pool_scales:
-            a = math.exp(-1.0 / float(scale))
-            ema = torch.zeros_like(x[:, 0, :])
-            seq = []
-            for t in range(x.shape[1]):
-                ema = float(a) * ema + (1.0 - float(a)) * x[:, t, :]
-                seq.append(ema)
-            outs.append(torch.stack(seq, dim=1))
+        b, l, d = x.shape
+        cs = torch.cat([torch.zeros(b, 1, d, device=x.device, dtype=x.dtype), x.cumsum(dim=1)], dim=1)
+        idx = torch.arange(l, device=x.device)
         out = torch.zeros_like(x)
-        for w, o in zip(mix, outs):
-            out = out + w * o
+        for w, scale in zip(mix, self.causal_pool_scales):
+            win = max(1, int(scale))
+            start = (idx + 1 - win).clamp_min(0)
+            end = idx + 1
+            sums = cs[:, end, :] - cs[:, start, :]
+            denom = (end - start).to(dtype=x.dtype).view(1, l, 1).clamp_min(1.0)
+            out = out + w * (sums / denom)
         return out
 
     @staticmethod
