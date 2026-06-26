@@ -6,6 +6,7 @@ from typing import Dict, Optional, Tuple
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 @dataclass
@@ -95,7 +96,8 @@ class DynamicOperatorBank1D(nn.Module):
             names.append(f'learned_depthwise_{learned_count}')
         self.mode_names = names[:self.n_modes]
         self.learned_indices = [i for i,n in enumerate(self.mode_names) if n.startswith('learned_depthwise_')]
-        self.dw = nn.ModuleList([nn.Conv1d(dim, dim, 3, padding=1, groups=dim, bias=False) for _ in self.learned_indices])
+        dw_padding = 0 if (self.enable_token_primitives and not self.enable_hand_token_primitives) else 1
+        self.dw = nn.ModuleList([nn.Conv1d(dim, dim, 3, padding=dw_padding, groups=dim, bias=False) for _ in self.learned_indices])
 
         self.mode_scale = nn.Parameter(torch.ones(n_modes))
         self.mode_bias = nn.Parameter(torch.zeros(n_modes, 1, dim))
@@ -224,13 +226,17 @@ class DynamicOperatorBank1D(nn.Module):
         return g.expand_as(x)
 
     def input_conditioned(self, x: torch.Tensor) -> torch.Tensor:
-        gate = self.input_gate(self._features(x)).unsqueeze(1)
         if self.enable_token_primitives and not self.enable_hand_token_primitives:
+            k = self.learned_causal_kernel(x)
             local = self.learned_causal_pool(x)
-            high = x - self.learned_causal_kernel(x)
-        else:
-            local = self.local_avg(x)
-            high = x - local
+            high = x - k
+            # Per-position causal gate. No sequence-wide mean/max/std here, because
+            # that would leak future token information in LM mode.
+            gate = self.input_gate(torch.cat([x, k, local, high], dim=-1))
+            return gate * local + (1.0 - gate) * high
+        gate = self.input_gate(self._features(x)).unsqueeze(1)
+        local = self.local_avg(x)
+        high = x - local
         return gate * local + (1.0 - gate) * high
 
     def apply_mode(self, x: torch.Tensor, mode_idx: int) -> torch.Tensor:
@@ -256,7 +262,11 @@ class DynamicOperatorBank1D(nn.Module):
         if name == 'input_conditioned': return self.input_conditioned(x)
         if name.startswith('learned_depthwise_'):
             j = self.learned_indices.index(int(mode_idx))
-            return self.dw[j](x.transpose(1, 2)).transpose(1, 2)
+            xt = x.transpose(1, 2)
+            if self.enable_token_primitives and not self.enable_hand_token_primitives:
+                # Causal depthwise conv: kernel positions see [t-2,t-1,t], never t+1.
+                xt = F.pad(xt, (2, 0))
+            return self.dw[j](xt).transpose(1, 2)
         return x
 
     def apply_all(self, x: torch.Tensor) -> torch.Tensor:
