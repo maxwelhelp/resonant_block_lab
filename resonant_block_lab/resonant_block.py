@@ -91,13 +91,20 @@ class DynamicOperatorBank1D(nn.Module):
         if self.enable_input_primitive and len(names) < self.n_modes:
             names.append('input_conditioned')
         learned_count = 0
+        null_count = 0
         while len(names) < self.n_modes:
-            learned_count += 1
-            names.append(f'learned_depthwise_{learned_count}')
+            if self.enable_token_primitives and not self.enable_hand_token_primitives:
+                # No hidden convolutional/super-primitive in token discovery mode.
+                # Extra capacity is explicit no-op/null slots so the controller must
+                # solve the task with causal kernel/pool/delta + costed memory.
+                null_count += 1
+                names.append(f'null_{null_count}')
+            else:
+                learned_count += 1
+                names.append(f'learned_depthwise_{learned_count}')
         self.mode_names = names[:self.n_modes]
         self.learned_indices = [i for i,n in enumerate(self.mode_names) if n.startswith('learned_depthwise_')]
-        dw_padding = 0 if (self.enable_token_primitives and not self.enable_hand_token_primitives) else 1
-        self.dw = nn.ModuleList([nn.Conv1d(dim, dim, 3, padding=dw_padding, groups=dim, bias=False) for _ in self.learned_indices])
+        self.dw = nn.ModuleList([nn.Conv1d(dim, dim, 3, padding=1, groups=dim, bias=False) for _ in self.learned_indices])
 
         self.mode_scale = nn.Parameter(torch.ones(n_modes))
         self.mode_bias = nn.Parameter(torch.zeros(n_modes, 1, dim))
@@ -262,11 +269,9 @@ class DynamicOperatorBank1D(nn.Module):
         if name == 'input_conditioned': return self.input_conditioned(x)
         if name.startswith('learned_depthwise_'):
             j = self.learned_indices.index(int(mode_idx))
-            xt = x.transpose(1, 2)
-            if self.enable_token_primitives and not self.enable_hand_token_primitives:
-                # Causal depthwise conv: kernel positions see [t-2,t-1,t], never t+1.
-                xt = F.pad(xt, (2, 0))
-            return self.dw[j](xt).transpose(1, 2)
+            return self.dw[j](x.transpose(1, 2)).transpose(1, 2)
+        if name.startswith('null_'):
+            return torch.zeros_like(x)
         return x
 
     def apply_all(self, x: torch.Tensor) -> torch.Tensor:

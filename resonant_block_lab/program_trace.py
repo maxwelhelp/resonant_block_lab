@@ -31,6 +31,7 @@ OP_DESCRIPTIONS = {
     'learned_causal_pool': 'learned causal EMA/pooling over past context; not fixed prefix_mean',
     'delta_causal': 'difference between current state and learned causal kernel read',
     'memory_read': 'external costed slot-memory read, controlled by memory gates',
+    'null_': 'explicit no-op capacity slot, not a learned operator',
 }
 
 

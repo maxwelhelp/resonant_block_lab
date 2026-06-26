@@ -187,7 +187,7 @@ def run_epoch(model, loader, opt, args, device, train=True):
 
 def main():
     ap=argparse.ArgumentParser()
-    ap.add_argument('--variant', choices=['conv','res_lm'], default='res_lm')
+    ap.add_argument('--variant', choices=['res_lm'], default='res_lm')
     ap.add_argument('--corpus_dir', default='/home/maxwelhelp/test/sience/experiments/math_search/WORKING_BEST/resonant_block_lab')
     ap.add_argument('--max_bytes', type=int, default=20000000)
     ap.add_argument('--seq_len', type=int, default=128)

@@ -5,11 +5,9 @@ export PYTHONPATH=.
 RUN_ROOT="${RUN_ROOT:-runs/token_lm_sweep_$(date +%Y%m%d_%H%M%S)}"
 CORPUS_DIR="${CORPUS_DIR:-/home/maxwelhelp/test/sience/experiments/math_search/WORKING_BEST}"
 mkdir -p "$RUN_ROOT"
-for name in conv res_discovery res_memory_v2; do
+for name in res_discovery res_memory_v2; do
   echo "================ $name ================"
-  if [ "$name" = "conv" ]; then
-    FLAGS="--variant conv --n_modes 8"
-  elif [ "$name" = "res_discovery" ]; then
+  if [ "$name" = "res_discovery" ]; then
     FLAGS="--variant res_lm --n_modes 10 --enable_token_primitives --enable_matrix_program --enable_lowrank --enable_input_primitive --program_steps 2 --program_rank 8"
   else
     FLAGS="--variant res_lm --n_modes 10 --enable_token_primitives --enable_matrix_program --enable_lowrank --enable_input_primitive --enable_slot_memory --memory_slots ${MEMORY_SLOTS:-6} --w_mem_read ${W_MEM_READ:-0.005} --w_mem_write ${W_MEM_WRITE:-0.010} --w_mem_garbage ${W_MEM_GARBAGE:-0.080} --w_mem_energy ${W_MEM_ENERGY:-0.001} --program_steps 2 --program_rank 8"
