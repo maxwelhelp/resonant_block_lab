@@ -21,6 +21,16 @@ OP_DESCRIPTIONS = {
     'symbolic_product': 'ordered matrix program W = product_s (I + sum_i c_si O_i)',
     'low_rank_global': 'learned low-rank global matrix/basis summary',
     'input_conditioned': 'operator generated from current input/field statistics',
+    'prev1': 'causal previous-token shift, no future leakage',
+    'prev2': 'causal two-token memory shift',
+    'prev4': 'causal four-token memory shift',
+    'causal_avg3': 'causal local average over current and previous tokens',
+    'prefix_mean': 'causal prefix summary / cheap global past context',
+    'delta_prev': 'token transition / difference from previous state',
+    'learned_causal_kernel': 'learned causal offset mixture; can discover prev1/prev2/long offsets',
+    'learned_causal_pool': 'learned causal EMA/pooling over past context; not fixed prefix_mean',
+    'delta_causal': 'difference between current state and learned causal kernel read',
+    'memory_read': 'external costed slot-memory read, controlled by memory gates',
 }
 
 

@@ -28,6 +28,10 @@ class FractalResonantConfig:
     enable_symbolic_product: bool = False
     enable_lowrank: bool = False
     enable_input_primitive: bool = False
+    enable_token_primitives: bool = False
+    enable_hand_token_primitives: bool = False
+    enable_slot_memory: bool = False
+    memory_slots: int = 8
     program_steps: int = 2
     program_rank: int = 8
 
@@ -74,6 +78,52 @@ class UnifiedFractalController(nn.Module):
         }
 
 
+class CostedSlotMemory(nn.Module):
+    """Small differentiable memory with explicit read/write gates and usage stats.
+
+    This is intentionally not a ready-made prefix/prev primitive. The controller
+    must pay to write/read a small number of slots. Garbage memory is penalized
+    later when slots are written but not read.
+    """
+    def __init__(self, dim: int, slots: int = 8):
+        super().__init__()
+        self.dim = int(dim)
+        self.slots = int(slots)
+        self.slot_keys = nn.Parameter(torch.randn(slots, dim) * 0.02)
+        self.in_norm = nn.LayerNorm(dim * 2)
+        self.query = nn.Linear(dim * 2, dim)
+        self.key_proj = nn.Linear(dim, dim, bias=False)
+        self.write_value = nn.Linear(dim * 2, dim)
+        self.write_slot = nn.Linear(dim * 2, slots)
+        self.read_gate = nn.Linear(dim * 2, 1)
+        self.write_gate = nn.Linear(dim * 2, 1)
+        self.decay_gate = nn.Linear(dim * 2, 1)
+
+    def forward(self, pool: torch.Tensor, ctx: torch.Tensor, slots: torch.Tensor):
+        b, s, d = slots.shape
+        h = self.in_norm(torch.cat([pool, ctx], dim=-1))
+        q = F.normalize(torch.tanh(self.query(h)), dim=-1)
+        keys = F.normalize(self.slot_keys[None, :, :].to(slots.dtype) + self.key_proj(slots), dim=-1)
+        read_logits = torch.einsum('bd,bsd->bs', q, keys) / math.sqrt(max(1, d))
+        read_w = torch.softmax(read_logits, dim=-1)
+        rg = torch.sigmoid(self.read_gate(h))
+        read_vec = rg * torch.einsum('bs,bsd->bd', read_w, slots)
+
+        write_w = torch.softmax(self.write_slot(h), dim=-1)
+        wg = torch.sigmoid(self.write_gate(h))
+        decay = torch.sigmoid(self.decay_gate(h)).view(b, 1, 1)
+        val = torch.tanh(self.write_value(h)).view(b, 1, d)
+        new_slots = decay * slots + wg.view(b, 1, 1) * write_w.view(b, s, 1) * val
+        stats = {
+            'memory_read_gate': rg.squeeze(-1),
+            'memory_write_gate': wg.squeeze(-1),
+            'memory_read_weights': read_w,
+            'memory_write_weights': write_w,
+            'memory_slot_energy': new_slots.float().pow(2).mean(dim=(1, 2)),
+        }
+        return read_vec, new_slots, stats
+
+
 class FractalResonantSequenceBlock(nn.Module):
     """Macro/micro resonant sequence block.
 
@@ -96,6 +146,8 @@ class FractalResonantSequenceBlock(nn.Module):
             enable_symbolic_product=config.enable_symbolic_product,
             enable_lowrank=config.enable_lowrank,
             enable_input_primitive=config.enable_input_primitive,
+            enable_token_primitives=config.enable_token_primitives,
+            enable_hand_token_primitives=config.enable_hand_token_primitives,
             program_steps=config.program_steps,
             program_rank=config.program_rank,
         )
@@ -110,6 +162,7 @@ class FractalResonantSequenceBlock(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
         self.affine_projector = nn.Linear(d * 4, config.aux_classes) if config.aux_classes > 0 else None
         self.ff = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, d * 2), nn.GELU(), nn.Linear(d * 2, d)) if config.use_ff_refine else None
+        self.slot_memory = CostedSlotMemory(d, config.memory_slots) if config.enable_slot_memory else None
 
     @staticmethod
     def features(x: torch.Tensor) -> torch.Tensor:
@@ -146,11 +199,15 @@ class FractalResonantSequenceBlock(nn.Module):
         ctx_keys = self.reader.k(context)
         ctx_values = self.reader.v(context)
         macro_memory_state = torch.zeros(b, d, device=x.device, dtype=x.dtype)
+        slot_memory = torch.zeros(b, self.config.memory_slots, d, device=x.device, dtype=x.dtype) if self.slot_memory is not None else None
+        mem_read_usage = torch.zeros(b, self.config.memory_slots, device=x.device, dtype=x.dtype) if self.slot_memory is not None else None
+        mem_write_usage = torch.zeros(b, self.config.memory_slots, device=x.device, dtype=x.dtype) if self.slot_memory is not None else None
 
         macro_states, micro_states = [], []
         macro_logits, micro_logits = [], []
         macro_plan_q_hist, micro_macro_q_hist, micro_q_hist, q_eff_hist, gate_hist = [], [], [], [], []
         macro_delta_hist, micro_delta_hist, ent_hist = [], [], []
+        memory_read_gate_hist, memory_write_gate_hist, memory_slot_energy_hist = [], [], []
 
         for t in range(self.config.macro_steps):
             macro_ctx, macro_ent = self.reader.read_precomputed(psi, ctx_keys, ctx_values)
@@ -169,7 +226,16 @@ class FractalResonantSequenceBlock(nn.Module):
                 gates = cfg['gates']
                 micro_q = cfg['micro_q']
                 macro_q_for_update = macro_q
-                phi = self._update(phi, init, ctx, macro_memory_state, macro_q_for_update, micro_q, gates)
+                memory_for_update = macro_memory_state
+                if self.slot_memory is not None:
+                    mem_read, slot_memory, mem_stats = self.slot_memory(phi.mean(1), ctx, slot_memory)
+                    memory_for_update = macro_memory_state + mem_read
+                    mem_read_usage = mem_read_usage + mem_stats['memory_read_gate'].view(b, 1) * mem_stats['memory_read_weights']
+                    mem_write_usage = mem_write_usage + mem_stats['memory_write_gate'].view(b, 1) * mem_stats['memory_write_weights']
+                    memory_read_gate_hist.append(mem_stats['memory_read_gate'])
+                    memory_write_gate_hist.append(mem_stats['memory_write_gate'])
+                    memory_slot_energy_hist.append(mem_stats['memory_slot_energy'])
+                phi = self._update(phi, init, ctx, memory_for_update, macro_q_for_update, micro_q, gates)
                 micro_memory = cfg['memory']
 
                 if self.affine_projector is not None:
@@ -218,6 +284,17 @@ class FractalResonantSequenceBlock(nn.Module):
             'attn_entropy': torch.stack(ent_hist).mean(),
             'program': self.bank.replay_description(q_eff_all.reshape(-1, self.config.n_modes)),
         }
+        if self.slot_memory is not None:
+            # Cost terms stay differentiable. Garbage = written slots that were barely read.
+            read_total = mem_read_usage.clamp_min(0.0)
+            write_total = mem_write_usage.clamp_min(0.0)
+            stats['memory_read_cost'] = torch.stack(memory_read_gate_hist).mean() if memory_read_gate_hist else y.new_tensor(0.0)
+            stats['memory_write_cost'] = torch.stack(memory_write_gate_hist).mean() if memory_write_gate_hist else y.new_tensor(0.0)
+            stats['memory_slot_energy'] = torch.stack(memory_slot_energy_hist).mean() if memory_slot_energy_hist else y.new_tensor(0.0)
+            stats['memory_garbage_cost'] = (write_total * torch.exp(-4.0 * read_total)).mean()
+            stats['memory_unused_slots'] = torch.exp(-2.0 * (read_total + write_total)).mean()
+            stats['memory_read_usage_mean'] = read_total.mean()
+            stats['memory_write_usage_mean'] = write_total.mean()
         if macro_logits:
             stats['macro_logits'] = torch.stack(macro_logits, dim=1)
         if micro_logits:
@@ -274,6 +351,8 @@ class FractalResonantSequenceClassifier(nn.Module):
                  use_ff_refine: bool = False, head_mode: str = 'attractor_only', mix_topk: int = 0,
                  enable_matrix_program: bool = False, enable_symbolic_product: bool = False,
                  enable_lowrank: bool = False, enable_input_primitive: bool = False,
+                 enable_token_primitives: bool = False, enable_hand_token_primitives: bool = False,
+                 enable_slot_memory: bool = False, memory_slots: int = 8,
                  program_steps: int = 2, program_rank: int = 8):
         super().__init__()
         self.in_proj = nn.Linear(input_dim, dim)
@@ -289,6 +368,10 @@ class FractalResonantSequenceClassifier(nn.Module):
             enable_symbolic_product=bool(enable_symbolic_product),
             enable_lowrank=bool(enable_lowrank),
             enable_input_primitive=bool(enable_input_primitive),
+            enable_token_primitives=bool(enable_token_primitives),
+            enable_hand_token_primitives=bool(enable_hand_token_primitives),
+            enable_slot_memory=bool(enable_slot_memory),
+            memory_slots=int(memory_slots),
             program_steps=int(program_steps),
             program_rank=int(program_rank),
         )

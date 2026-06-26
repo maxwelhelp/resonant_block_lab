@@ -58,20 +58,29 @@ class DynamicOperatorBank1D(nn.Module):
                  enable_symbolic_product: bool = False,
                  enable_lowrank: bool = False,
                  enable_input_primitive: bool = False,
+                 enable_token_primitives: bool = False,
+                 enable_hand_token_primitives: bool = False,
                  program_steps: int = 2,
                  program_rank: int = 8):
         super().__init__()
         self.dim = int(dim)
         self.n_modes = int(n_modes)
-        self.n_fixed_modes = 6
+        self.n_fixed_modes = 8 if bool(enable_hand_token_primitives) else (4 if bool(enable_token_primitives) else 6)
         self.program_steps = int(program_steps)
         self.program_rank = int(program_rank)
         self.enable_symbolic_additive = bool(enable_symbolic_additive)
         self.enable_symbolic_product = bool(enable_symbolic_product)
         self.enable_lowrank = bool(enable_lowrank)
         self.enable_input_primitive = bool(enable_input_primitive)
+        self.enable_token_primitives = bool(enable_token_primitives)
+        self.enable_hand_token_primitives = bool(enable_hand_token_primitives)
 
-        names = ['identity', 'shift_left', 'shift_right', 'local_avg', 'global_mean', 'highpass']
+        if self.enable_hand_token_primitives:
+            names = ['identity', 'prev1', 'prev2', 'prev4', 'causal_avg3', 'prefix_mean', 'delta_prev', 'global_mean']
+        elif self.enable_token_primitives:
+            names = ['identity', 'learned_causal_kernel', 'learned_causal_pool', 'delta_causal']
+        else:
+            names = ['identity', 'shift_left', 'shift_right', 'local_avg', 'global_mean', 'highpass']
         if self.enable_symbolic_additive and len(names) < self.n_modes:
             names.append('symbolic_additive')
         if self.enable_symbolic_product and len(names) < self.n_modes:
@@ -95,11 +104,16 @@ class DynamicOperatorBank1D(nn.Module):
         # Matrix-program parameters. They are only used if their mode exists.
         self.symbolic_additive_logits = nn.Parameter(torch.zeros(self.n_fixed_modes))
         self.symbolic_product_logits = nn.Parameter(torch.zeros(self.program_steps, self.n_fixed_modes))
-        self.symbolic_product_step = nn.Parameter(torch.full((self.program_steps,), -1.4))
+        self.symbolic_product_step = nn.Parameter(torch.full((self.program_steps,), 0.12))
         r = max(1, min(self.program_rank, dim))
         self.low_down = nn.Linear(dim, r, bias=False)
         self.low_up = nn.Linear(r, dim, bias=False)
         self.input_gate = nn.Sequential(nn.LayerNorm(dim * 4), nn.Linear(dim * 4, dim), nn.Sigmoid())
+        # Discovery token operators: not hand prev1/prefix. They learn offset/decay distribution.
+        self.causal_offsets = [0, 1, 2, 4, 8, 16, 32]
+        self.causal_kernel_logits = nn.Parameter(torch.zeros(len(self.causal_offsets)))
+        self.causal_pool_logits = nn.Parameter(torch.zeros(6))
+        self.causal_pool_scales = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0]
 
         for conv in self.dw:
             nn.init.zeros_(conv.weight)
@@ -108,7 +122,7 @@ class DynamicOperatorBank1D(nn.Module):
         with torch.no_grad():
             # Start product programs close to identity for stability.
             self.symbolic_additive_logits[0] = 2.0
-            self.symbolic_product_logits[:, 0] = 2.0
+            self.symbolic_product_logits[:, 0] = 1.0
 
     @staticmethod
     def shift_left(x):
@@ -123,10 +137,57 @@ class DynamicOperatorBank1D(nn.Module):
         return (DynamicOperatorBank1D.shift_right(x) + x + DynamicOperatorBank1D.shift_left(x)) / 3.0
 
     @staticmethod
+    def prev_k(x, k: int):
+        if k <= 0:
+            return x
+        return torch.cat([x[:, :1, :].expand(-1, k, -1), x[:, :-k, :]], dim=1) if x.shape[1] > k else x[:, :1, :].expand_as(x)
+
+    @staticmethod
+    def causal_avg3(x):
+        return (x + DynamicOperatorBank1D.prev_k(x, 1) + DynamicOperatorBank1D.prev_k(x, 2)) / 3.0
+
+    @staticmethod
+    def prefix_mean(x):
+        c = x.cumsum(dim=1)
+        den = torch.arange(1, x.shape[1] + 1, device=x.device, dtype=x.dtype).view(1, -1, 1)
+        return c / den
+
+    def learned_causal_kernel(self, x: torch.Tensor) -> torch.Tensor:
+        weights = torch.softmax(self.causal_kernel_logits, dim=-1).to(dtype=x.dtype, device=x.device)
+        out = torch.zeros_like(x)
+        for w, k in zip(weights, self.causal_offsets):
+            out = out + w * self.prev_k(x, int(k))
+        return out
+
+    def learned_causal_pool(self, x: torch.Tensor) -> torch.Tensor:
+        # Mixture of causal exponential moving averages. This can discover
+        # previous-token-like or longer-context behavior without hand naming it.
+        mix = torch.softmax(self.causal_pool_logits, dim=-1).to(dtype=x.dtype, device=x.device)
+        outs = []
+        for scale in self.causal_pool_scales:
+            a = math.exp(-1.0 / float(scale))
+            ema = torch.zeros_like(x[:, 0, :])
+            seq = []
+            for t in range(x.shape[1]):
+                ema = float(a) * ema + (1.0 - float(a)) * x[:, t, :]
+                seq.append(ema)
+            outs.append(torch.stack(seq, dim=1))
+        out = torch.zeros_like(x)
+        for w, o in zip(mix, outs):
+            out = out + w * o
+        return out
+
+    @staticmethod
     def _features(x):
         return torch.cat([x.mean(1), x.std(1), x.max(1).values, x.pow(2).mean(1)], dim=-1)
 
     def base_ops(self, x: torch.Tensor):
+        if self.enable_hand_token_primitives:
+            p1 = self.prev_k(x, 1)
+            return [x, p1, self.prev_k(x, 2), self.prev_k(x, 4), self.causal_avg3(x), self.prefix_mean(x), x - p1, x.mean(dim=1, keepdim=True).expand_as(x)]
+        if self.enable_token_primitives:
+            k = self.learned_causal_kernel(x)
+            return [x, k, self.learned_causal_pool(x), x - k]
         return [
             x,
             self.shift_left(x),
@@ -157,18 +218,33 @@ class DynamicOperatorBank1D(nn.Module):
         return h
 
     def low_rank_global(self, x: torch.Tensor) -> torch.Tensor:
+        if self.enable_token_primitives and not self.enable_hand_token_primitives:
+            return self.low_up(self.low_down(self.learned_causal_pool(x)))
         g = self.low_up(self.low_down(x.mean(dim=1))).unsqueeze(1)
         return g.expand_as(x)
 
     def input_conditioned(self, x: torch.Tensor) -> torch.Tensor:
         gate = self.input_gate(self._features(x)).unsqueeze(1)
-        local = self.local_avg(x)
-        high = x - local
+        if self.enable_token_primitives and not self.enable_hand_token_primitives:
+            local = self.learned_causal_pool(x)
+            high = x - self.learned_causal_kernel(x)
+        else:
+            local = self.local_avg(x)
+            high = x - local
         return gate * local + (1.0 - gate) * high
 
     def apply_mode(self, x: torch.Tensor, mode_idx: int) -> torch.Tensor:
         name = self.mode_names[int(mode_idx)]
         if name == 'identity': return x
+        if name == 'prev1': return self.prev_k(x, 1)
+        if name == 'prev2': return self.prev_k(x, 2)
+        if name == 'prev4': return self.prev_k(x, 4)
+        if name == 'causal_avg3': return self.causal_avg3(x)
+        if name == 'prefix_mean': return self.prefix_mean(x)
+        if name == 'delta_prev': return x - self.prev_k(x, 1)
+        if name == 'learned_causal_kernel': return self.learned_causal_kernel(x)
+        if name == 'learned_causal_pool': return self.learned_causal_pool(x)
+        if name == 'delta_causal': return x - self.learned_causal_kernel(x)
         if name == 'shift_left': return self.shift_left(x)
         if name == 'shift_right': return self.shift_right(x)
         if name == 'local_avg': return self.local_avg(x)
@@ -219,7 +295,12 @@ class DynamicOperatorBank1D(nn.Module):
         return out
 
     def program_formulas(self) -> Dict:
-        base = ['identity', 'shift_left', 'shift_right', 'local_avg', 'global_mean', 'highpass']
+        if self.enable_hand_token_primitives:
+            base = ['identity', 'prev1', 'prev2', 'prev4', 'causal_avg3', 'prefix_mean', 'delta_prev', 'global_mean']
+        elif self.enable_token_primitives:
+            base = ['identity', 'learned_causal_kernel', 'learned_causal_pool', 'delta_causal']
+        else:
+            base = ['identity', 'shift_left', 'shift_right', 'local_avg', 'global_mean', 'highpass']
         coeff = torch.softmax(self.symbolic_additive_logits.detach().float(), dim=-1).cpu()
         prod = torch.softmax(self.symbolic_product_logits.detach().float(), dim=-1).cpu()
         steps = torch.tanh(self.symbolic_product_step.detach().float()).cpu() * 0.35
@@ -231,6 +312,12 @@ class DynamicOperatorBank1D(nn.Module):
                 for s in range(self.program_steps)
             ],
             'program_rank': self.program_rank,
+            'token_primitives': self.enable_token_primitives,
+            'hand_token_primitives': self.enable_hand_token_primitives,
+            'causal_kernel_offsets': list(self.causal_offsets),
+            'causal_kernel_weights': [float(v) for v in torch.softmax(self.causal_kernel_logits.detach().float(), dim=-1).cpu()],
+            'causal_pool_scales': list(self.causal_pool_scales),
+            'causal_pool_weights': [float(v) for v in torch.softmax(self.causal_pool_logits.detach().float(), dim=-1).cpu()],
         }
 
     def replay_description(self, q: torch.Tensor, topk: int = 4) -> Dict:

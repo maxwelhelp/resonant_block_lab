@@ -146,7 +146,7 @@ def main():
     out=Path(args.out_dir); out.mkdir(parents=True,exist_ok=True); (out/'config.json').write_text(json.dumps(vars(args),indent=2,ensure_ascii=False))
     tr=DataLoader(SeqProgramDataset(args.train_n,args.length,args.input_dim,args.classes,1,args.noise),batch_size=args.batch,shuffle=True,pin_memory=device.type=='cuda')
     va=DataLoader(SeqProgramDataset(args.val_n,args.length,args.input_dim,args.classes,999,args.noise),batch_size=args.batch,shuffle=False,pin_memory=device.type=='cuda')
-    model=FractalResonantSequenceClassifier(args.input_dim,args.dim,args.classes,args.n_modes,args.macro_steps,args.micro_steps,args.use_ff_refine,args.head_mode,args.mix_topk,args.enable_matrix_program,args.enable_symbolic_product,args.enable_lowrank,args.enable_input_primitive,args.program_steps,args.program_rank).to(device)
+    model=FractalResonantSequenceClassifier(args.input_dim,args.dim,args.classes,args.n_modes,args.macro_steps,args.micro_steps,args.use_ff_refine,args.head_mode,args.mix_topk,args.enable_matrix_program,args.enable_symbolic_product,args.enable_lowrank,args.enable_input_primitive,False,False,8,args.program_steps,args.program_rank).to(device)
     opt=torch.optim.AdamW(model.parameters(),lr=args.lr,weight_decay=1e-4)
     print('params',sum(p.numel() for p in model.parameters() if p.requires_grad),flush=True)
     rows=[]; best=0.0

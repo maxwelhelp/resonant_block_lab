@@ -332,7 +332,7 @@ def counterfactual_mode_credit(model, x, y, loss_eval_fn, max_modes: int | None 
     n_modes = int(bank.mode_scale.numel())
     if max_modes is not None and max_modes > 0:
         n_modes = min(n_modes, int(max_modes))
-    mode_names = ProgramBrain()._names(int(bank.mode_scale.numel()))
+    mode_names = list(getattr(bank, 'mode_names', [])) or ProgramBrain()._names(int(bank.mode_scale.numel()))
     with torch.no_grad():
         base_logits, base_stats = model(x, return_stats=True)
         base_loss = float(loss_eval_fn(base_logits, base_stats, y).detach().float().cpu())
