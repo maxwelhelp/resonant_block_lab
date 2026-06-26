@@ -175,8 +175,45 @@ class FractalResonantSequenceBlock(nn.Module):
     def features(x: torch.Tensor) -> torch.Tensor:
         return torch.cat([x.mean(1), x.std(1), x.max(1).values, x.pow(2).mean(1)], dim=-1)
 
+    @staticmethod
+    def _apply_mode_intervention(q: torch.Tensor, intervention, level: str, step: int) -> torch.Tensor:
+        if not intervention:
+            return q
+        disables = intervention.get('disable_modes', []) if isinstance(intervention, dict) else []
+        bias_map = intervention.get('mode_logit_bias', {}) if isinstance(intervention, dict) else {}
+        out = q
+        changed = False
+        for item in disables:
+            try:
+                if item.get('level') == level and int(item.get('step')) == int(step):
+                    mode = int(item.get('mode'))
+                    if 0 <= mode < out.shape[-1]:
+                        if not changed:
+                            out = out.clone(); changed = True
+                        out[..., mode] = 0.0
+            except Exception:
+                pass
+        # Support tuple keys or string keys like "effective:7:3". Bias is applied in prob space as exp-like multiplier.
+        for key, val in (bias_map or {}).items():
+            try:
+                if isinstance(key, str):
+                    parts = key.split(':')
+                    k_level, k_step, k_mode = parts[0], int(parts[1]), int(parts[2])
+                else:
+                    k_level, k_step, k_mode = key
+                if k_level == level and int(k_step) == int(step) and 0 <= int(k_mode) < out.shape[-1]:
+                    if not changed:
+                        out = out.clone(); changed = True
+                    out[..., int(k_mode)] = out[..., int(k_mode)] * torch.exp(torch.as_tensor(float(val), device=out.device, dtype=out.dtype))
+            except Exception:
+                pass
+        if changed:
+            out = out / out.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        return out
+
     def _update(self, phi: torch.Tensor, init: torch.Tensor, ctx: torch.Tensor, memory: torch.Tensor,
-                macro_q: torch.Tensor, micro_q: torch.Tensor, gates: torch.Tensor) -> torch.Tensor:
+                macro_q: torch.Tensor, micro_q: torch.Tensor, gates: torch.Tensor,
+                intervention=None, effective_step: int = -1) -> torch.Tensor:
         b, l, d = phi.shape
         alpha = gates[:, 0].view(b, 1, 1)
         beta = gates[:, 1].view(b, 1, 1)
@@ -185,6 +222,7 @@ class FractalResonantSequenceBlock(nn.Module):
         rho = gates[:, 4].view(b, 1, 1)
         macro_mix = gates[:, 5].view(b, 1)
         q_eff = F.normalize(macro_mix * macro_q + (1.0 - macro_mix) * micro_q, p=1, dim=-1)
+        q_eff = self._apply_mode_intervention(q_eff, intervention, 'effective', effective_step)
         mixed = self.bank.mix_topk(phi, q_eff, self.config.mix_topk) if self.config.mix_topk else self.bank.mix(phi, q_eff)
         update = torch.tanh(
             gamma * self.state_proj(mixed)
@@ -197,7 +235,7 @@ class FractalResonantSequenceBlock(nn.Module):
             out = out + 0.25 * self.ff(out)
         return out
 
-    def forward(self, x: torch.Tensor, context: Optional[torch.Tensor] = None, return_stats: bool = False):
+    def forward(self, x: torch.Tensor, context: Optional[torch.Tensor] = None, return_stats: bool = False, intervention=None):
         if context is None:
             context = x
         psi = x
@@ -221,6 +259,7 @@ class FractalResonantSequenceBlock(nn.Module):
             macro_cfg = self.controller(psi.mean(1), macro_ctx, macro_memory_state, t, 0, level_id=0)
             macro_memory_state = macro_cfg['memory']
             macro_q = macro_cfg['macro_q']
+            macro_q = self._apply_mode_intervention(macro_q, intervention, 'macro', t)
             macro_plan_q_hist.append(macro_q)
             micro_memory = macro_memory_state
             old_macro = psi
@@ -232,6 +271,8 @@ class FractalResonantSequenceBlock(nn.Module):
                 old = phi
                 gates = cfg['gates']
                 micro_q = cfg['micro_q']
+                eff_step = t * self.config.micro_steps + m
+                micro_q = self._apply_mode_intervention(micro_q, intervention, 'micro', eff_step)
                 macro_q_for_update = macro_q
                 memory_for_update = macro_memory_state
                 if self.slot_memory is not None:
@@ -242,7 +283,7 @@ class FractalResonantSequenceBlock(nn.Module):
                     memory_read_gate_hist.append(mem_stats['memory_read_gate'])
                     memory_write_gate_hist.append(mem_stats['memory_write_gate'])
                     memory_slot_energy_hist.append(mem_stats['memory_slot_energy'])
-                phi = self._update(phi, init, ctx, memory_for_update, macro_q_for_update, micro_q, gates)
+                phi = self._update(phi, init, ctx, memory_for_update, macro_q_for_update, micro_q, gates, intervention=intervention, effective_step=eff_step)
                 micro_memory = cfg['memory']
 
                 if self.affine_projector is not None:
@@ -251,7 +292,9 @@ class FractalResonantSequenceBlock(nn.Module):
                 micro_macro_q_hist.append(macro_q_for_update)
                 micro_q_hist.append(micro_q)
                 macro_mix = gates[:, 5].view(b, 1)
-                q_eff_hist.append(F.normalize(macro_mix * macro_q_for_update + (1.0 - macro_mix) * micro_q, p=1, dim=-1))
+                q_hist = F.normalize(macro_mix * macro_q_for_update + (1.0 - macro_mix) * micro_q, p=1, dim=-1)
+                q_hist = self._apply_mode_intervention(q_hist, intervention, 'effective', eff_step)
+                q_eff_hist.append(q_hist)
                 gate_hist.append(gates.mean(0))
                 micro_delta_hist.append((phi - old).float().pow(2).mean((1, 2)).sqrt())
                 ent_hist.append(ent)

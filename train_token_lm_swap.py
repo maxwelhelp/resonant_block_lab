@@ -10,6 +10,12 @@ from torch.utils.data import Dataset, DataLoader
 
 from resonant_block_lab.fractal_sequence import FractalResonantConfig, FractalResonantSequenceBlock
 from resonant_block_lab.program_brain import ProgramBrain, counterfactual_mode_credit, write_program_brain_outputs
+from resonant_block_lab.self_learning.token_program_brain import TokenProgramBrain
+from resonant_block_lab.self_learning.mode_registry import summarize_categories
+from resonant_block_lab.self_learning.best_archive import BestProgramArchive
+from resonant_block_lab.self_learning.mode_feedback_memory import ModeFeedbackMemory
+from resonant_block_lab.self_learning.mode_relation_memory import ModeRelationMemory
+from resonant_block_lab.self_learning.program_search import TargetedProgramSearch
 
 IGNORE_INDEX = -100
 
@@ -161,13 +167,13 @@ class TokenLMSwap(nn.Module):
         if args.tie_weights:
             self.lm_head.weight = self.embed.weight
 
-    def forward(self, x, return_stats=False):
+    def forward(self, x, return_stats=False, intervention=None):
         h = self.embed(x) + self.pos[:, :x.shape[1], :]
         stats = {}
         if self.variant == 'conv':
             h = self.block(h)
         else:
-            h, stats = self.res(h, return_stats=True)
+            h, stats = self.res(h, return_stats=True, intervention=intervention)
         logits = self.lm_head(self.norm(h))
         if return_stats:
             return logits, stats
@@ -190,6 +196,7 @@ def run_epoch(model, loader, opt, args, device, train=True):
     model.train(train)
     total_loss = 0.0; total_acc = 0.0; n = 0
     brain = ProgramBrain() if (not train and model.variant == 'res_lm') else None
+    token_brain = TokenProgramBrain(getattr(getattr(model, 'res', None), 'bank', None).mode_names if (not train and model.variant == 'res_lm' and getattr(getattr(model, 'res', None), 'bank', None) is not None) else None) if (not train and model.variant == 'res_lm') else None
     credit_x = credit_y = None
     for bi,(x,y) in enumerate(loader,1):
         x=x.to(device); y=y.to(device)
@@ -218,6 +225,14 @@ def run_epoch(model, loader, opt, args, device, train=True):
                     + args.w_mem_energy * stats.get('memory_slot_energy', loss.new_tensor(0.0))
                 )
                 loss = loss + mem_pen
+            if model.variant == 'res_lm' and args.input_conditioned_cost > 0 and 'q_eff_history' in stats:
+                try:
+                    names = list(getattr(getattr(model, 'res', None).bank, 'mode_names', []))
+                    if 'input_conditioned' in names:
+                        idx = names.index('input_conditioned')
+                        loss = loss + args.input_conditioned_cost * stats['q_eff_history'][..., idx].mean()
+                except Exception:
+                    pass
             if train:
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
@@ -229,14 +244,52 @@ def run_epoch(model, loader, opt, args, device, train=True):
         total_acc += token_acc(logits, y) * bs
         n += bs
         if brain is not None:
-            # Brain expects sample-level y for acc; use sequence exact proxy by first target token to keep reports alive.
-            brain.add(stats, y[:,0], logits.mean(1))
+            # Legacy ProgramBrain kept for existing reports; TokenProgramBrain is the correct token-level diagnostic.
+            brain.add(stats, y[:,0].clamp_min(0), logits.mean(1))
+            if token_brain is not None:
+                token_brain.add_batch(stats, logits, y)
             if credit_x is None:
                 credit_x=x.detach(); credit_y=y.detach()
         if train and args.log_every and bi % args.log_every == 0:
             print(f'batch {bi:4d}/{len(loader)} loss={float(loss.detach()):.3f} acc={token_acc(logits,y):.3f} memR={float(stats.get("memory_read_cost", loss.new_tensor(0.0)).detach().cpu()):.3f} memW={float(stats.get("memory_write_cost", loss.new_tensor(0.0)).detach().cpu()):.3f} garbage={float(stats.get("memory_garbage_cost", loss.new_tensor(0.0)).detach().cpu()):.3f}', flush=True)
-    return total_loss/max(1,n), total_acc/max(1,n), brain, credit_x, credit_y
+    return total_loss/max(1,n), total_acc/max(1,n), brain, token_brain, credit_x, credit_y
 
+
+
+@torch.no_grad()
+def run_step_local_credit(model, x, y, args, feedback_memory=None, relation_memory=None):
+    if model.variant != 'res_lm':
+        return {}
+    logits, stats = model(x, return_stats=True)
+    full_loss = seq_loss(logits, y)
+    q = stats.get('q_eff_history', None)
+    if q is None or q.numel() == 0:
+        return {'step_local_credit_count': 0}
+    q_mean = q.float().mean(dim=0)  # [steps, modes]
+    steps, modes = q_mean.shape
+    candidates = []
+    for st in range(steps):
+        vals, idx = q_mean[st].topk(min(3, modes))
+        for v, m in zip(vals.tolist(), idx.tolist()):
+            candidates.append((float(v), int(st), int(m)))
+    candidates.sort(reverse=True)
+    rows = []
+    names = list(getattr(getattr(model, 'res', None).bank, 'mode_names', [])) if getattr(model, 'res', None) is not None else [f'mode_{i}' for i in range(modes)]
+    for _, st, m in candidates[:max(1, int(args.credit_budget))]:
+        inter = {'disable_modes': [{'level': 'effective', 'step': st, 'mode': m}]}
+        ab_logits, _ = model(x, return_stats=True, intervention=inter)
+        ab_loss = seq_loss(ab_logits, y)
+        gain = float((ab_loss - full_loss).detach().cpu())
+        row = {'level': 'effective', 'step': st, 'mode_id': m, 'mode': names[m] if m < len(names) else f'mode_{m}', 'full_loss': float(full_loss.detach().cpu()), 'ablated_loss': float(ab_loss.detach().cpu()), 'gain': gain}
+        rows.append(row)
+        if feedback_memory is not None:
+            feedback_memory.update('effective', st, m, gain)
+        if relation_memory is not None:
+            top_modes = q_mean[st].topk(min(3, modes)).indices.tolist()
+            relation_memory.update(top_modes, gain)
+    pos = sum(1 for r in rows if r['gain'] > 0)
+    neg = sum(1 for r in rows if r['gain'] < 0)
+    return {'step_local_credit_count': len(rows), 'step_local_credit_positive': pos, 'step_local_credit_negative': neg, 'step_local_credit_rows': rows}
 
 def main():
     ap=argparse.ArgumentParser()
@@ -282,6 +335,20 @@ def main():
     ap.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     ap.add_argument('--out_dir', default='runs/token_lm_swap')
     ap.add_argument('--credit_modes', type=int, default=0)
+    ap.add_argument('--enable_mode_credit', action='store_true')
+    ap.add_argument('--credit_budget', type=int, default=4)
+    ap.add_argument('--credit_batch_size', type=int, default=32)
+    ap.add_argument('--enable_mode_relation', action='store_true')
+    ap.add_argument('--enable_program_search', action='store_true')
+    ap.add_argument('--program_search_patience', type=int, default=8)
+    ap.add_argument('--program_burst_duration', type=int, default=5)
+    ap.add_argument('--program_temperature_mult', type=float, default=1.4)
+    ap.add_argument('--program_collapse_threshold', type=float, default=0.70)
+    ap.add_argument('--input_conditioned_cost', type=float, default=0.0)
+    ap.add_argument('--enable_program_dynamics', action='store_true', default=True)
+    ap.add_argument('--enable_best_archive', action='store_true', default=True)
+    ap.add_argument('--enable_token_program_brain', action='store_true', default=True)
+    ap.add_argument('--enable_mode_categories', action='store_true', default=True)
     ap.add_argument('--log_every', type=int, default=50)
     args=ap.parse_args()
     device=torch.device(args.device if args.device=='cpu' or torch.cuda.is_available() else 'cpu')
@@ -300,26 +367,60 @@ def main():
     va=DataLoader(val,batch_size=args.batch,shuffle=False,num_workers=2,pin_memory=device.type=='cuda')
     model=TokenLMSwap(args).to(device)
     opt=torch.optim.AdamW(model.parameters(),lr=args.lr,weight_decay=args.weight_decay)
+    bank = getattr(getattr(model, 'res', None), 'bank', None)
+    mode_names = list(getattr(bank, 'mode_names', [])) if bank is not None else []
+    n_modes_for_memory = len(mode_names) if mode_names else args.n_modes
+    n_eff_steps = args.macro_steps * args.micro_steps
+    feedback_memory = ModeFeedbackMemory(n_steps_by_level={'effective': n_eff_steps, 'macro': args.macro_steps, 'micro': n_eff_steps}, n_modes=n_modes_for_memory, device=device) if args.enable_mode_credit else None
+    relation_memory = ModeRelationMemory(n_modes_for_memory, device=device) if args.enable_mode_relation else None
+    program_search = TargetedProgramSearch(args.program_search_patience, args.program_burst_duration, args.program_collapse_threshold, args.program_temperature_mult) if args.enable_program_search else None
     out=Path(args.out_dir)/args.variant; out.mkdir(parents=True,exist_ok=True)
     (out/'config.json').write_text(json.dumps({**vars(args), 'corpus_bytes': corpus_bytes}, indent=2))
+    archive = BestProgramArchive(out) if args.enable_best_archive else None
     rows=[]; best=999.0
     print('variant',args.variant,'task',args.task,'bytes',corpus_bytes,'params',sum(p.numel() for p in model.parameters() if p.requires_grad),flush=True)
     for ep in range(1,args.epochs+1):
         t=time.time()
-        tr_loss,tr_acc,_,_,_=run_epoch(model,tr,opt,args,device,True)
-        va_loss,va_acc,brain,credit_x,credit_y=run_epoch(model,va,opt,args,device,False)
+        tr_loss,tr_acc,_,_,_,_=run_epoch(model,tr,opt,args,device,True)
+        va_loss,va_acc,brain,token_brain,credit_x,credit_y=run_epoch(model,va,opt,args,device,False)
         row={'epoch':ep,'train_loss':tr_loss,'train_acc':tr_acc,'val_loss':va_loss,'val_acc':va_acc,'ppl':math.exp(min(20,va_loss)),'sec':time.time()-t}
         # Memory costs are already included in loss during training. Compact values live in PROGRAM_DYNAMICS via stats.
         rows.append(row)
         print(json.dumps(row),flush=True)
         if brain is not None:
             summary=brain.finalize(ep, {'val_acc': va_acc, 'final_acc': va_acc})
+            if token_brain is not None:
+                summary['token_program_brain'] = token_brain.finalize()
+            bank = getattr(getattr(model, 'res', None), 'bank', None)
+            if bank is not None and hasattr(bank, 'mode_names'):
+                weights = None
+                try:
+                    weights = [float(v) for v in summary.get('program', {}).get('all_weights', {}).values()]
+                except Exception:
+                    weights = None
+                summary.update(summarize_categories(list(bank.mode_names), weights if weights and len(weights)==len(bank.mode_names) else None))
             if credit_x is not None and args.credit_modes > 0:
                 def _eval_loss(logits, stats, yy): return seq_loss(logits, yy)
                 summary['true_counterfactual_credit']=counterfactual_mode_credit(model, credit_x, credit_y, _eval_loss, min(args.credit_modes, args.n_modes))
+            if credit_x is not None and args.enable_mode_credit:
+                cx = credit_x[:args.credit_batch_size]
+                cy = credit_y[:args.credit_batch_size]
+                summary['step_local_credit'] = run_step_local_credit(model, cx, cy, args, feedback_memory, relation_memory)
+                if feedback_memory is not None:
+                    summary.update(feedback_memory.summary(mode_names))
+                if relation_memory is not None:
+                    summary.update(relation_memory.summary(mode_names))
+            
+            if program_search is not None:
+                summary['program_search'] = program_search.update(va_acc, summary)
             write_program_brain_outputs(out, summary, best_acc=-best, row_acc=va_acc)
         if va_loss < best:
             best=va_loss; torch.save({'model':model.state_dict(),'args':vars(args),'row':row},out/'best.pt')
+            try:
+                if archive is not None and brain is not None:
+                    archive.maybe_update(ep, va_loss, va_acc, model, summary if 'summary' in locals() else {}, row)
+            except Exception as e:
+                print('archive_warn', repr(e), flush=True)
             print('best_loss',best,flush=True)
         with (out/'history.csv').open('w',newline='') as f:
             w=csv.DictWriter(f,fieldnames=list(rows[0].keys())); w.writeheader(); w.writerows(rows)
