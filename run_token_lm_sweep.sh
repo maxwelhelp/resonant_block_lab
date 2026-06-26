@@ -13,6 +13,10 @@ for name in res_discovery res_memory_v2; do
     FLAGS="--variant res_lm --n_modes 10 --enable_token_primitives --enable_matrix_program --enable_lowrank --enable_input_primitive --enable_slot_memory --memory_slots ${MEMORY_SLOTS:-6} --w_mem_read ${W_MEM_READ:-0.005} --w_mem_write ${W_MEM_WRITE:-0.010} --w_mem_garbage ${W_MEM_GARBAGE:-0.080} --w_mem_energy ${W_MEM_ENERGY:-0.001} --program_steps 2 --program_rank 8"
   fi
   PYTHONPATH=. python -u train_token_lm_swap.py \
+    --vocab "${VOCAB:-256}" \
+    --task "${TASK:-byte_lm}" \
+    --memory_delay "${MEMORY_DELAY:-64}" \
+    --memory_pairs "${MEMORY_PAIRS:-3}" \
     --epochs "${EPOCHS:-10}" \
     --batch "${BATCH:-128}" \
     --seq_len "${SEQ_LEN:-128}" \

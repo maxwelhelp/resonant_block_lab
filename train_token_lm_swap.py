@@ -11,6 +11,8 @@ from torch.utils.data import Dataset, DataLoader
 from resonant_block_lab.fractal_sequence import FractalResonantConfig, FractalResonantSequenceBlock
 from resonant_block_lab.program_brain import ProgramBrain, counterfactual_mode_credit, write_program_brain_outputs
 
+IGNORE_INDEX = -100
+
 
 def collect_text(root: str, max_bytes: int = 20_000_000) -> bytes:
     p = Path(root).expanduser()
@@ -58,6 +60,52 @@ class ByteLMDataset(Dataset):
         start = (self.offset + i * 9973) % self.max_start
         chunk = self.ids[start:start+self.seq_len+1]
         return chunk[:-1], chunk[1:]
+
+
+class LongRangeRecallDataset(Dataset):
+    """Synthetic long-range token memory task.
+
+    Input contains WRITE,value pairs far before QUERY positions. Target is only
+    defined at QUERY positions. For delay > max causal-kernel offset, a local
+    primitive cannot directly copy the value; the model must use pooled/slot memory
+    or discover a longer strategy.
+    """
+    WRITE = 1
+    QUERY = 2
+    PAD = 0
+
+    def __init__(self, seq_len: int, n_samples: int, vocab: int = 128, delay: int = 64, pairs: int = 3, offset: int = 0):
+        assert vocab > 16
+        self.seq_len = int(seq_len)
+        self.n_samples = int(n_samples)
+        self.vocab = int(vocab)
+        self.delay = int(delay)
+        self.pairs = int(pairs)
+        self.offset = int(offset)
+        if self.delay + 4 >= self.seq_len:
+            raise ValueError(f"memory delay {self.delay} too large for seq_len {self.seq_len}")
+
+    def __len__(self):
+        return self.n_samples
+
+    def __getitem__(self, i):
+        g = torch.Generator()
+        g.manual_seed(1234567 + self.offset + int(i) * 1009)
+        x = torch.randint(10, self.vocab, (self.seq_len,), generator=g, dtype=torch.long)
+        y = torch.full((self.seq_len,), IGNORE_INDEX, dtype=torch.long)
+        max_write = self.seq_len - self.delay - 2
+        # Spread pairs across the usable prefix and add tiny deterministic jitter.
+        for j in range(self.pairs):
+            base = 2 + (j * max(1, max_write - 3)) // max(1, self.pairs)
+            jitter = int(torch.randint(0, max(1, min(4, max_write - base)), (1,), generator=g)) if base < max_write else 0
+            wpos = min(max_write, base + jitter)
+            qpos = wpos + self.delay
+            value = int(torch.randint(10, self.vocab, (1,), generator=g))
+            x[wpos] = self.WRITE
+            x[wpos + 1] = value
+            x[qpos] = self.QUERY
+            y[qpos] = value
+        return x, y
 
 
 class CausalConvMixer(nn.Module):
@@ -127,11 +175,15 @@ class TokenLMSwap(nn.Module):
 
 
 def seq_loss(logits, y):
-    return F.cross_entropy(logits.reshape(-1, logits.shape[-1]), y.reshape(-1))
+    return F.cross_entropy(logits.reshape(-1, logits.shape[-1]), y.reshape(-1), ignore_index=IGNORE_INDEX)
 
 
 def token_acc(logits, y):
-    return float((logits.argmax(-1) == y).float().mean().detach().cpu())
+    pred = logits.argmax(-1)
+    mask = (y != IGNORE_INDEX)
+    if not bool(mask.any()):
+        return 0.0
+    return float((pred[mask] == y[mask]).float().mean().detach().cpu())
 
 
 def run_epoch(model, loader, opt, args, device, train=True):
@@ -171,7 +223,8 @@ def run_epoch(model, loader, opt, args, device, train=True):
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 opt.step()
-        bs = x.numel()
+        bs = int((y != IGNORE_INDEX).sum().item()) if (y == IGNORE_INDEX).any() else x.numel()
+        bs = max(1, bs)
         total_loss += float(loss.detach().cpu()) * bs
         total_acc += token_acc(logits, y) * bs
         n += bs
@@ -188,6 +241,9 @@ def run_epoch(model, loader, opt, args, device, train=True):
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--variant', choices=['res_lm'], default='res_lm')
+    ap.add_argument('--task', choices=['byte_lm','memory_recall'], default='byte_lm')
+    ap.add_argument('--memory_delay', type=int, default=64)
+    ap.add_argument('--memory_pairs', type=int, default=3)
     ap.add_argument('--corpus_dir', default='/home/maxwelhelp/test/sience/experiments/math_search/WORKING_BEST/resonant_block_lab')
     ap.add_argument('--max_bytes', type=int, default=20000000)
     ap.add_argument('--seq_len', type=int, default=128)
@@ -229,18 +285,25 @@ def main():
     ap.add_argument('--log_every', type=int, default=50)
     args=ap.parse_args()
     device=torch.device(args.device if args.device=='cpu' or torch.cuda.is_available() else 'cpu')
-    data=collect_text(args.corpus_dir, args.max_bytes)
-    split=max(args.seq_len+2, int(len(data)*0.9))
-    train=ByteLMDataset(data[:split], args.seq_len, args.train_samples, 0)
-    val=ByteLMDataset(data[split:] if len(data)-split > args.seq_len+2 else data, args.seq_len, args.val_samples, 123)
+    if args.task == 'byte_lm':
+        data=collect_text(args.corpus_dir, args.max_bytes)
+        split=max(args.seq_len+2, int(len(data)*0.9))
+        train=ByteLMDataset(data[:split], args.seq_len, args.train_samples, 0)
+        val=ByteLMDataset(data[split:] if len(data)-split > args.seq_len+2 else data, args.seq_len, args.val_samples, 123)
+        corpus_bytes = len(data)
+    else:
+        data=b''
+        train=LongRangeRecallDataset(args.seq_len, args.train_samples, args.vocab, args.memory_delay, args.memory_pairs, 0)
+        val=LongRangeRecallDataset(args.seq_len, args.val_samples, args.vocab, args.memory_delay, args.memory_pairs, 10000000)
+        corpus_bytes = 0
     tr=DataLoader(train,batch_size=args.batch,shuffle=True,num_workers=2,pin_memory=device.type=='cuda')
     va=DataLoader(val,batch_size=args.batch,shuffle=False,num_workers=2,pin_memory=device.type=='cuda')
     model=TokenLMSwap(args).to(device)
     opt=torch.optim.AdamW(model.parameters(),lr=args.lr,weight_decay=args.weight_decay)
     out=Path(args.out_dir)/args.variant; out.mkdir(parents=True,exist_ok=True)
-    (out/'config.json').write_text(json.dumps({**vars(args), 'corpus_bytes': len(data)}, indent=2))
+    (out/'config.json').write_text(json.dumps({**vars(args), 'corpus_bytes': corpus_bytes}, indent=2))
     rows=[]; best=999.0
-    print('variant',args.variant,'bytes',len(data),'params',sum(p.numel() for p in model.parameters() if p.requires_grad),flush=True)
+    print('variant',args.variant,'task',args.task,'bytes',corpus_bytes,'params',sum(p.numel() for p in model.parameters() if p.requires_grad),flush=True)
     for ep in range(1,args.epochs+1):
         t=time.time()
         tr_loss,tr_acc,_,_,_=run_epoch(model,tr,opt,args,device,True)

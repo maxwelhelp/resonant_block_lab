@@ -79,11 +79,11 @@ class UnifiedFractalController(nn.Module):
 
 
 class CostedSlotMemory(nn.Module):
-    """Small differentiable memory with explicit read/write gates and usage stats.
+    """Small differentiable slot memory with per-token read/write.
 
-    This is intentionally not a ready-made prefix/prev primitive. The controller
-    must pay to write/read a small number of slots. Garbage memory is penalized
-    later when slots are written but not read.
+    Slots are written from sequence positions and read back per position. This is
+    still parallel over the sequence, but unlike the old global read vector it can
+    support key/value recall where different query positions need different values.
     """
     def __init__(self, dim: int, slots: int = 8):
         super().__init__()
@@ -99,29 +99,36 @@ class CostedSlotMemory(nn.Module):
         self.write_gate = nn.Linear(dim * 2, 1)
         self.decay_gate = nn.Linear(dim * 2, 1)
 
-    def forward(self, pool: torch.Tensor, ctx: torch.Tensor, slots: torch.Tensor):
-        b, s, d = slots.shape
-        h = self.in_norm(torch.cat([pool, ctx], dim=-1))
-        q = F.normalize(torch.tanh(self.query(h)), dim=-1)
+    def forward(self, seq: torch.Tensor, ctx: torch.Tensor, slots: torch.Tensor):
+        b, l, d = seq.shape
+        _, s, _ = slots.shape
+        ctx_seq = ctx[:, None, :].expand(-1, l, -1)
+        h = self.in_norm(torch.cat([seq, ctx_seq], dim=-1))
+
         keys = F.normalize(self.slot_keys[None, :, :].to(slots.dtype) + self.key_proj(slots), dim=-1)
-        read_logits = torch.einsum('bd,bsd->bs', q, keys) / math.sqrt(max(1, d))
+        q = F.normalize(torch.tanh(self.query(h)), dim=-1)
+        read_logits = torch.einsum('bld,bsd->bls', q, keys) / math.sqrt(max(1, d))
         read_w = torch.softmax(read_logits, dim=-1)
         rg = torch.sigmoid(self.read_gate(h))
-        read_vec = rg * torch.einsum('bs,bsd->bd', read_w, slots)
+        read_seq = rg * torch.einsum('bls,bsd->bld', read_w, slots)
 
         write_w = torch.softmax(self.write_slot(h), dim=-1)
         wg = torch.sigmoid(self.write_gate(h))
-        decay = torch.sigmoid(self.decay_gate(h)).view(b, 1, 1)
-        val = torch.tanh(self.write_value(h)).view(b, 1, d)
-        new_slots = decay * slots + wg.view(b, 1, 1) * write_w.view(b, s, 1) * val
+        val = torch.tanh(self.write_value(h))
+        weighted = wg * write_w
+        denom = weighted.sum(dim=1).clamp_min(1e-4)  # [B,S]
+        slot_update = torch.einsum('bls,bld->bsd', weighted, val) / denom.unsqueeze(-1)
+        decay = torch.sigmoid(self.decay_gate(h)).mean(dim=1).view(b, 1, 1)
+        write_strength = weighted.sum(dim=1).clamp(max=1.0).unsqueeze(-1)
+        new_slots = decay * slots + write_strength * slot_update
         stats = {
-            'memory_read_gate': rg.squeeze(-1),
-            'memory_write_gate': wg.squeeze(-1),
-            'memory_read_weights': read_w,
-            'memory_write_weights': write_w,
+            'memory_read_gate': rg.squeeze(-1).mean(dim=1),
+            'memory_write_gate': wg.squeeze(-1).mean(dim=1),
+            'memory_read_weights': read_w.mean(dim=1),
+            'memory_write_weights': weighted.mean(dim=1),
             'memory_slot_energy': new_slots.float().pow(2).mean(dim=(1, 2)),
         }
-        return read_vec, new_slots, stats
+        return read_seq, new_slots, stats
 
 
 class FractalResonantSequenceBlock(nn.Module):
@@ -183,7 +190,7 @@ class FractalResonantSequenceBlock(nn.Module):
             gamma * self.state_proj(mixed)
             + beta * self.input_proj(ctx[:, None, :].expand(b, l, d))
             + eta * self.init_proj(init)
-            + rho * self.memory_proj(memory[:, None, :].expand(b, l, d))
+            + rho * self.memory_proj((memory if memory.dim() == 3 else memory[:, None, :]).expand(b, l, d))
         )
         out = self.norm((1.0 - alpha) * phi + alpha * self.dropout(update))
         if self.ff is not None:
@@ -228,8 +235,8 @@ class FractalResonantSequenceBlock(nn.Module):
                 macro_q_for_update = macro_q
                 memory_for_update = macro_memory_state
                 if self.slot_memory is not None:
-                    mem_read, slot_memory, mem_stats = self.slot_memory(phi.mean(1), ctx, slot_memory)
-                    memory_for_update = macro_memory_state + mem_read
+                    mem_read, slot_memory, mem_stats = self.slot_memory(phi, ctx, slot_memory)
+                    memory_for_update = macro_memory_state[:, None, :] + mem_read
                     mem_read_usage = mem_read_usage + mem_stats['memory_read_gate'].view(b, 1) * mem_stats['memory_read_weights']
                     mem_write_usage = mem_write_usage + mem_stats['memory_write_gate'].view(b, 1) * mem_stats['memory_write_weights']
                     memory_read_gate_hist.append(mem_stats['memory_read_gate'])
