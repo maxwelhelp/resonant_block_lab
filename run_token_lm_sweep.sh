@@ -17,6 +17,8 @@ for name in res_discovery res_memory_v2; do
     --task "${TASK:-byte_lm}" \
     --memory_delay "${MEMORY_DELAY:-64}" \
     --memory_pairs "${MEMORY_PAIRS:-3}" \
+    --kv_pairs "${KV_PAIRS:-32}" \
+    --kv_queries "${KV_QUERIES:-8}" \
     --epochs "${EPOCHS:-10}" \
     --batch "${BATCH:-128}" \
     --seq_len "${SEQ_LEN:-128}" \

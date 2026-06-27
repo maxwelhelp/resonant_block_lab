@@ -114,6 +114,82 @@ class LongRangeRecallDataset(Dataset):
         return x, y
 
 
+class AssociativeKVRecallDataset(Dataset):
+    """Attention-like associative retrieval benchmark.
+
+    Prefix contains many KEY, key_id, value_id records. Suffix contains QUERY,
+    key_id positions. The model is supervised only at the query key position and
+    must emit the value associated with the matching key. This imitates a causal
+    attention lookup over a long context: local kernels cannot solve it unless the
+    matching KV record is nearby by chance.
+    """
+    PAD = 0
+    KV = 1
+    QUERY = 2
+
+    def __init__(self, seq_len: int, n_samples: int, vocab: int = 256, n_kv: int = 32, n_queries: int = 8, offset: int = 0, noise: bool = True):
+        assert vocab >= 64, "kv_recall needs enough token ids; use vocab >= 64"
+        self.seq_len = int(seq_len)
+        self.n_samples = int(n_samples)
+        self.vocab = int(vocab)
+        self.n_kv = int(n_kv)
+        self.n_queries = int(n_queries)
+        self.offset = int(offset)
+        self.noise = bool(noise)
+        if 3 * self.n_kv + 2 * self.n_queries + 8 > self.seq_len:
+            raise ValueError(f"seq_len={seq_len} too small for n_kv={n_kv}, n_queries={n_queries}")
+        # Reserve disjoint token ranges to prevent trivial marker/value collisions.
+        span = max(4, (self.vocab - 10) // 2)
+        self.key_lo, self.key_hi = 10, 10 + span
+        self.val_lo, self.val_hi = 10 + span, self.vocab
+        if self.val_hi - self.val_lo < 8:
+            raise ValueError("vocab too small for value range")
+
+    def __len__(self):
+        return self.n_samples
+
+    def __getitem__(self, i):
+        g = torch.Generator()
+        g.manual_seed(9917719 + self.offset + int(i) * 7919)
+        if self.noise:
+            x = torch.randint(3, self.vocab, (self.seq_len,), generator=g, dtype=torch.long)
+        else:
+            x = torch.full((self.seq_len,), self.PAD, dtype=torch.long)
+        y = torch.full((self.seq_len,), IGNORE_INDEX, dtype=torch.long)
+
+        # Unique keys. Values may repeat, like real vocab tokens.
+        key_count = self.key_hi - self.key_lo
+        if self.n_kv > key_count:
+            raise ValueError(f"n_kv={self.n_kv} exceeds key token range {key_count}")
+        perm = torch.randperm(key_count, generator=g)[:self.n_kv] + self.key_lo
+        keys = [int(v) for v in perm.tolist()]
+        vals = [int(torch.randint(self.val_lo, self.val_hi, (1,), generator=g)) for _ in range(self.n_kv)]
+
+        # Spread records through the whole prefix, not adjacent to queries.
+        prefix_end = self.seq_len - 2 * self.n_queries - 2
+        usable = max(1, prefix_end - 3)
+        for j, (k, v) in enumerate(zip(keys, vals)):
+            base = 1 + (j * usable) // max(1, self.n_kv)
+            jitter_max = max(1, min(5, prefix_end - base - 2))
+            jitter = int(torch.randint(0, jitter_max, (1,), generator=g)) if jitter_max > 1 else 0
+            pos = min(prefix_end - 3, base + jitter)
+            x[pos] = self.KV
+            x[pos + 1] = k
+            x[pos + 2] = v
+
+        # Queries live near the tail. They ask for random earlier keys.
+        qperm = torch.randperm(self.n_kv, generator=g)[:self.n_queries]
+        query_start = self.seq_len - 2 * self.n_queries - 1
+        for qi, idx in enumerate(qperm.tolist()):
+            qpos = query_start + 2 * qi
+            k = keys[idx]
+            v = vals[idx]
+            x[qpos] = self.QUERY
+            x[qpos + 1] = k
+            y[qpos + 1] = v
+        return x, y
+
+
 class CausalConvMixer(nn.Module):
     def __init__(self, dim: int, kernel: int = 5):
         super().__init__()
@@ -294,9 +370,12 @@ def run_step_local_credit(model, x, y, args, feedback_memory=None, relation_memo
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--variant', choices=['res_lm'], default='res_lm')
-    ap.add_argument('--task', choices=['byte_lm','memory_recall'], default='byte_lm')
+    ap.add_argument('--task', choices=['byte_lm','memory_recall','kv_recall'], default='byte_lm')
     ap.add_argument('--memory_delay', type=int, default=64)
     ap.add_argument('--memory_pairs', type=int, default=3)
+    ap.add_argument('--kv_pairs', type=int, default=32)
+    ap.add_argument('--kv_queries', type=int, default=8)
+    ap.add_argument('--kv_no_noise', action='store_true')
     ap.add_argument('--corpus_dir', default='/home/maxwelhelp/test/sience/experiments/math_search/WORKING_BEST/resonant_block_lab')
     ap.add_argument('--max_bytes', type=int, default=20000000)
     ap.add_argument('--seq_len', type=int, default=128)
@@ -364,11 +443,18 @@ def main():
         train=ByteLMDataset(data[:split], args.seq_len, args.train_samples, 0)
         val=ByteLMDataset(data[split:] if len(data)-split > args.seq_len+2 else data, args.seq_len, args.val_samples, 123)
         corpus_bytes = len(data)
-    else:
+    elif args.task == 'memory_recall':
         data=b''
         train=LongRangeRecallDataset(args.seq_len, args.train_samples, args.vocab, args.memory_delay, args.memory_pairs, 0)
         val=LongRangeRecallDataset(args.seq_len, args.val_samples, args.vocab, args.memory_delay, args.memory_pairs, 10000000)
         corpus_bytes = 0
+    elif args.task == 'kv_recall':
+        data=b''
+        train=AssociativeKVRecallDataset(args.seq_len, args.train_samples, args.vocab, args.kv_pairs, args.kv_queries, 0, noise=(not args.kv_no_noise))
+        val=AssociativeKVRecallDataset(args.seq_len, args.val_samples, args.vocab, args.kv_pairs, args.kv_queries, 10000000, noise=(not args.kv_no_noise))
+        corpus_bytes = 0
+    else:
+        raise ValueError(f'unknown task {args.task}')
     tr=DataLoader(train,batch_size=args.batch,shuffle=True,num_workers=2,pin_memory=device.type=='cuda')
     va=DataLoader(val,batch_size=args.batch,shuffle=False,num_workers=2,pin_memory=device.type=='cuda')
     model=TokenLMSwap(args).to(device)
