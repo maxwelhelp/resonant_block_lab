@@ -138,10 +138,22 @@ class AssociativeKVRecallDataset(Dataset):
         self.noise = bool(noise)
         if 3 * self.n_kv + 2 * self.n_queries + 8 > self.seq_len:
             raise ValueError(f"seq_len={seq_len} too small for n_kv={n_kv}, n_queries={n_queries}")
-        # Reserve disjoint token ranges to prevent trivial marker/value collisions.
-        span = max(4, (self.vocab - 10) // 2)
-        self.key_lo, self.key_hi = 10, 10 + span
-        self.val_lo, self.val_hi = 10 + span, self.vocab
+        # Prefer disjoint key/value ranges when they are large enough. If not,
+        # fall back to a shared content range. For LLM-like KV recall this is fine:
+        # markers define the role, while key/value tokens can come from the same
+        # vocabulary just like normal language tokens.
+        content_lo, content_hi = 10, self.vocab
+        disjoint_span = max(4, (self.vocab - content_lo) // 2)
+        if self.n_kv <= disjoint_span:
+            self.key_lo, self.key_hi = content_lo, content_lo + disjoint_span
+            self.val_lo, self.val_hi = content_lo + disjoint_span, self.vocab
+            self.shared_kv_range = False
+        else:
+            self.key_lo, self.key_hi = content_lo, content_hi
+            self.val_lo, self.val_hi = content_lo, content_hi
+            self.shared_kv_range = True
+        if self.key_hi - self.key_lo < self.n_kv:
+            raise ValueError(f"n_kv={self.n_kv} exceeds key token range {self.key_hi - self.key_lo}; increase --vocab or reduce --kv_pairs")
         if self.val_hi - self.val_lo < 8:
             raise ValueError("vocab too small for value range")
 
@@ -159,8 +171,6 @@ class AssociativeKVRecallDataset(Dataset):
 
         # Unique keys. Values may repeat, like real vocab tokens.
         key_count = self.key_hi - self.key_lo
-        if self.n_kv > key_count:
-            raise ValueError(f"n_kv={self.n_kv} exceeds key token range {key_count}")
         perm = torch.randperm(key_count, generator=g)[:self.n_kv] + self.key_lo
         keys = [int(v) for v in perm.tolist()]
         vals = [int(torch.randint(self.val_lo, self.val_hi, (1,), generator=g)) for _ in range(self.n_kv)]
