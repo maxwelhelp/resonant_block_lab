@@ -165,9 +165,20 @@ class ProgramBrain:
     def _names(self, r: int):
         if self.mode_names and len(self.mode_names) >= r:
             return self.mode_names[:r]
-        base = ['identity','shift_left','shift_right','local_avg','global_mean','highpass']
+        base = [
+            'identity',
+            'learned_causal_kernel',
+            'learned_causal_pool',
+            'delta_causal',
+            'symbolic_additive',
+            'low_rank_global',
+            'input_conditioned',
+            'null_1',
+            'null_2',
+            'null_3',
+        ]
         while len(base) < r:
-            base.append(f'learned_depthwise_{len(base)-5}')
+            base.append(f'mode_{len(base)}')
         return base[:r]
 
     def _named_vector(self, v: torch.Tensor):
